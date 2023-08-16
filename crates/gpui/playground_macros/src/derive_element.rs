@@ -5,6 +5,8 @@ use syn::{
     WhereClause,
 };
 
+use crate::derive_into_element::impl_into_element;
+
 pub fn derive_element(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
     let type_name = ast.ident;
@@ -62,6 +64,15 @@ pub fn derive_element(input: TokenStream) -> TokenStream {
         }
     }
 
+    let impl_into_element = impl_into_element(
+        &impl_generics,
+        &crate_name,
+        &view_type_name,
+        &type_name,
+        &type_generics,
+        &where_clause,
+    );
+
     let gen = quote! {
         impl #impl_generics #crate_name::element::Element<#view_type_name> for #type_name #type_generics
         #where_clause
@@ -96,6 +107,8 @@ pub fn derive_element(input: TokenStream) -> TokenStream {
                 Ok(())
             }
         }
+
+        #impl_into_element
     };
 
     gen.into()
