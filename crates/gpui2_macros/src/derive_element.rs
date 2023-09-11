@@ -59,28 +59,30 @@ pub fn derive_element(input: TokenStream) -> TokenStream {
     );
 
     let gen = quote! {
-        impl #impl_generics playground::element::Element<#view_type_name> for #type_name #type_generics
+        impl #impl_generics gpui2::element::Element<#view_type_name> for #type_name #type_generics
         #where_clause
         {
-            type Layout = Option<playground::element::AnyElement<#view_type_name #lifetimes>>;
+            type PaintState = gpui2::element::AnyElement<#view_type_name #lifetimes>;
 
             fn layout(
                 &mut self,
                 view: &mut V,
-                cx: &mut playground::element::LayoutContext<V>,
-            ) -> anyhow::Result<playground::element::Layout<V, Self::Layout>> {
-                let mut element = self.render(view, cx).into_any();
-                let layout_id = element.layout(view, cx)?;
-                Ok(playground::element::Layout::new(layout_id, Some(element)))
+                cx: &mut gpui2::ViewContext<V>,
+            ) -> anyhow::Result<(gpui2::element::LayoutId, Self::PaintState)> {
+                let mut rendered_element = self.render(view, cx).into_element().into_any();
+                let layout_id = rendered_element.layout(view, cx)?;
+                Ok((layout_id, rendered_element))
             }
 
             fn paint(
                 &mut self,
                 view: &mut V,
-                layout: &mut playground::element::Layout<V, Self::Layout>,
-                cx: &mut playground::element::PaintContext<V>,
+                parent_origin: gpui2::Vector2F,
+                _: &gpui2::element::Layout,
+                rendered_element: &mut Self::PaintState,
+                cx: &mut gpui2::ViewContext<V>,
             ) {
-                layout.paint(view, cx);
+                rendered_element.paint(view, parent_origin, cx);
             }
         }
 
