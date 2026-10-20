@@ -189,18 +189,14 @@ pub(crate) fn new_timed_command_encoder<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     texture: &'a metal::TextureRef,
     viewport_size: Size<DevicePixels>,
-    clear_color: Option<metal::MTLClearColor>,
+    load_action: metal::MTLLoadAction,
 ) -> &'a metal::RenderCommandEncoderRef {
     let descriptor = metal::RenderPassDescriptor::new();
     let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
     color_attachment.set_texture(Some(texture));
     color_attachment.set_store_action(metal::MTLStoreAction::Store);
-    if let Some(clear_color) = clear_color {
-        color_attachment.set_load_action(metal::MTLLoadAction::Clear);
-        color_attachment.set_clear_color(clear_color);
-    } else {
-        color_attachment.set_load_action(metal::MTLLoadAction::Load);
-    }
+    color_attachment.set_load_action(load_action);
+    color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
     timer.time_pass(descriptor, pass);
 
     let encoder = command_buffer.new_render_command_encoder(descriptor);
