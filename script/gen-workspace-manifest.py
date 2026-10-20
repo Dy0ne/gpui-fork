@@ -4,7 +4,7 @@
 Zed's root manifest is not part of the filtered history (it lists hundreds of
 crates we don't carry), so it is regenerated after every upstream sync:
 
-  * members                 -> upstream members that exist here, plus our own crates
+  * members                 -> upstream members that exist here, plus our own crates/* and examples/*
   * workspace.dependencies  -> only the entries our crates reference with `workspace = true`
   * patch.crates-io         -> only patches for crates in our dependency graph
   * profile.*.package       -> only packages in our dependency graph
@@ -117,7 +117,8 @@ def main():
     upstream_members = upstream_manifest["workspace"]["members"]
 
     members = [m for m in upstream_members if os.path.isfile(os.path.join(FORK, m, "Cargo.toml"))]
-    for path in sorted(glob.glob(os.path.join(FORK, "crates", "*", "Cargo.toml"))):
+    own = glob.glob(os.path.join(FORK, "crates", "*", "Cargo.toml")) + glob.glob(os.path.join(FORK, "examples", "*", "Cargo.toml"))
+    for path in sorted(own):
         member = os.path.relpath(os.path.dirname(path), FORK)
         if member not in members:
             members.append(member)

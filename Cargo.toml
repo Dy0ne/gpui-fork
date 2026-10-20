@@ -33,6 +33,7 @@ members = [
     "crates/ztracing",
     "crates/ztracing_macro",
     "tooling/perf",
+    "examples/liquid_glass",
 ]
 
 [workspace.package]
