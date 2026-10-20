@@ -14,6 +14,11 @@ those release branches, not on Zed's `main`. This fork mirrors the channels:
 
 Hotfixes for stable go on main and are merged back into preview by hand.
 
+Downstream branches hold fork features and are fed from another local branch, not from upstream:
+
+  experimental  <- nightly        (fork features are developed here)
+  liquid-glass  <- experimental   (stable line of the liquid glass work)
+
 Upstream history comes in through `git filter-repo` "streams", one per
 script/upstream-paths/*.txt. filter-repo is deterministic, so re-filtering a
 newer Zed yields the same hashes for old commits and merging keeps working.
@@ -31,7 +36,8 @@ upstream always comes in as a second parent); a missing channel branch is recrea
 Usage:
   script/sync-upstream.py fetch                       refresh the Zed clone and refs/zed/*
   script/sync-upstream.py update [--no-fetch] [BRANCH...]
-                                                      merge upstream into nightly, preview, main (default: all)
+                                                      merge upstream into nightly, preview, main (default: these
+                                                      three), or a downstream branch's source into it
   script/sync-upstream.py update --to TAG BRANCH      merge a specific upstream release instead of the newest
   script/sync-upstream.py status                      show what each branch is based on
   script/sync-upstream.py tag [--no-verify]           check, test and tag the current branch as a fork release
@@ -58,6 +64,9 @@ GENERATED = ("Cargo.toml", "Cargo.lock")
 VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(-pre)?$")
 # channel branch -> whether it follows -pre tags (None: follows Zed main)
 CHANNELS = {"nightly": None, "preview": True, "main": False}
+# downstream branch -> the local branch it merges from, in update order
+DOWNSTREAM = {"experimental": "nightly", "liquid-glass": "experimental"}
+GENERATED_FROM_RE = re.compile(r"zed-industries/zed@([0-9a-f]{40})")
 
 
 def run(*cmd, cwd=FORK, check=True):
@@ -287,19 +296,48 @@ def update_branch(branch, target=None):
         print(f"{branch}: up to date with {label}")
 
 
+def generated_from(ref):
+    """The upstream commit that `ref`'s Cargo.toml was generated from."""
+    m = GENERATED_FROM_RE.search(git("show", f"{ref}:Cargo.toml"))
+    if not m:
+        sys.exit(f"{ref}:Cargo.toml has no @generated header; run script/gen-workspace-manifest.py there first")
+    return m[1]
+
+
+def update_downstream(branch):
+    source = DOWNSTREAM[branch]
+    if not ref_exists(f"refs/heads/{source}"):
+        sys.exit(f"{branch}: source branch {source} does not exist")
+    if not ref_exists(f"refs/heads/{branch}"):
+        git("branch", branch, source)
+        print(f"{branch}: created from {source}")
+        return
+    git("checkout", "--quiet", branch)
+    if is_ancestor(source, "HEAD"):
+        print(f"{branch}: up to date with {source}")
+        return
+    # the source is the upstream-ward side, so the merged tree is at its upstream revision
+    message = f"Merge {source} into {branch}"
+    merge(source, message, generated_from(source))
+    print(f"{branch}: {message}")
+
+
 def update(branches, no_fetch, to):
-    unknown = [b for b in branches if b not in CHANNELS]
+    unknown = [b for b in branches if b not in CHANNELS and b not in DOWNSTREAM]
     if unknown:
-        sys.exit(f"unknown branch {', '.join(unknown)}; channels are {', '.join(CHANNELS)}")
-    if to and (len(branches) != 1 or branches[0] == "nightly"):
+        sys.exit(f"unknown branch {', '.join(unknown)}; branches are {', '.join([*CHANNELS, *DOWNSTREAM])}")
+    if to and (len(branches) != 1 or branches[0] not in ("preview", "main")):
         sys.exit("--to needs exactly one branch: preview or main")
     require_clean()
-    if not no_fetch:
+    channels = [b for b in CHANNELS if not branches or b in branches]
+    if channels and not no_fetch:
         fetch()
     original = git("rev-parse", "--abbrev-ref", "HEAD")
-    for branch in CHANNELS:
-        if not branches or branch in branches:
-            update_branch(branch, to)
+    for branch in channels:
+        update_branch(branch, to)
+    for branch in DOWNSTREAM:
+        if branch in branches:
+            update_downstream(branch)
     if original != "HEAD":
         git("checkout", "--quiet", original)
 
@@ -318,6 +356,12 @@ def status():
         fork_tags = git("tag", "--points-at", branch, "--list", "v*").split()
         state = "up to date" if current == latest else f"behind (latest {latest})"
         print(f"{branch:8} zed {current or '-'}, {state}, fork tag at HEAD: {', '.join(fork_tags) or '-'}")
+    for branch, source in DOWNSTREAM.items():
+        if not ref_exists(f"refs/heads/{branch}"):
+            print(f"{branch:8} (missing)")
+            continue
+        behind = git("rev-list", "--count", f"{branch}..{source}")
+        print(f"{branch:8} {behind} commits of {source} not merged")
 
 
 def tag(verify):
