@@ -417,6 +417,9 @@ collections = { codegen-units = 1 }
 refineable = { codegen-units = 1 }
 reqwest_client = { codegen-units = 1 }
 
+# from members' [package.metadata.profile.dev]
+liquid_glass = { opt-level = 3 }
+
 [profile.release]
 debug = "limited"
 lto = "thin"

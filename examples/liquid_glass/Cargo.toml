@@ -13,3 +13,9 @@ gpui_platform = { path = "../../crates/gpui_platform", features = ["font-kit", "
 image.workspace = true
 libc.workspace = true
 rayon.workspace = true
+
+# The CPU renderer shades every glass pixel each frame; unoptimized it saturates two cores and
+# drops to a few fps. script/gen-workspace-manifest.py merges this into the root
+# [profile.dev.package], since Cargo reads profiles only from there.
+[package.metadata.profile.dev]
+opt-level = 3
