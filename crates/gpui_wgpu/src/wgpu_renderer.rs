@@ -1606,6 +1606,8 @@ impl WgpuRendererCore {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    // Backdrop layers are only implemented by the Metal renderer.
+                    PrimitiveBatch::BackdropLayers(_layers) => {}
                 }
             }
         }

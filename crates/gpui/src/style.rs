@@ -5,11 +5,11 @@ use std::{
 };
 
 use crate::{
-    AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
-    CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
-    point, px, quad, rems, size,
+    AbsoluteLength, App, BackdropEffect, Background, BackgroundTag, BorderStyle, Bounds,
+    ContentMask, Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges,
+    EdgesRefinement, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla,
+    Length, Pixels, Point, PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled,
+    TextRun, Window, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -291,6 +291,9 @@ pub struct Style {
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
 
+    /// The blurred backdrop drawn behind this element, from everything painted before it
+    pub backdrop: Option<BackdropStyle>,
+
     /// The text style of this element
     #[refineable]
     pub text: TextStyleRefinement,
@@ -342,6 +345,16 @@ pub enum Visibility {
     Visible,
     /// The element should not be drawn, but should still take up space in the layout.
     Hidden,
+}
+
+/// A backdrop drawn behind an element, set with [`Styled::backdrop`]. Only the Metal renderer
+/// draws it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct BackdropStyle {
+    /// Gaussian blur of the backdrop, as a standard deviation in logical pixels.
+    pub blur: Pixels,
+    /// How the blurred backdrop is drawn.
+    pub effect: BackdropEffect,
 }
 
 /// The possible values of the box-shadow property
@@ -710,6 +723,11 @@ impl Style {
 
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
 
+        // Before the background, so a translucent background tints the backdrop.
+        if let Some(backdrop) = self.backdrop {
+            window.paint_backdrop_layer(bounds, corner_radii, backdrop.blur, backdrop.effect);
+        }
+
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
             let mut border_color = match background_color {
@@ -806,6 +824,7 @@ impl Default for Style {
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
+            backdrop: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,

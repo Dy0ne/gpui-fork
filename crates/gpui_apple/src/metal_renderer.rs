@@ -3,8 +3,9 @@ use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, BackdropLayer, Background, Bounds, ContentMask, Corners, DevicePixels,
+    PaintSurface, Path, Point, PrimitiveBatch, Rgba, ScaledBackdropEffect, ScaledPixels, Scene,
+    Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -126,6 +127,12 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    backdrop_downsample_pipeline_state: metal::RenderPipelineState,
+    backdrop_blur_pipeline_state: metal::RenderPipelineState,
+    backdrop_composite_pipeline_state: metal::RenderPipelineState,
+    backdrop_copy_pipeline_state: metal::RenderPipelineState,
+    /// Created the first time a frame has backdrop layers, and resized with the viewport.
+    backdrop_textures: Option<BackdropTextures>,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -387,6 +394,38 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let backdrop_downsample_pipeline_state = build_backdrop_pipeline_state(
+            &device,
+            &library,
+            "backdrop_downsample",
+            "backdrop_fullscreen_vertex",
+            "backdrop_downsample_fragment",
+            false,
+        );
+        let backdrop_blur_pipeline_state = build_backdrop_pipeline_state(
+            &device,
+            &library,
+            "backdrop_blur",
+            "backdrop_fullscreen_vertex",
+            "backdrop_blur_fragment",
+            false,
+        );
+        let backdrop_composite_pipeline_state = build_backdrop_pipeline_state(
+            &device,
+            &library,
+            "backdrop_composite",
+            "backdrop_composite_vertex",
+            "backdrop_composite_fragment",
+            true,
+        );
+        let backdrop_copy_pipeline_state = build_backdrop_pipeline_state(
+            &device,
+            &library,
+            "backdrop_copy",
+            "backdrop_fullscreen_vertex",
+            "backdrop_copy_fragment",
+            false,
+        );
 
         let command_queue = device.new_command_queue();
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
@@ -427,6 +466,11 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            backdrop_downsample_pipeline_state,
+            backdrop_blur_pipeline_state,
+            backdrop_composite_pipeline_state,
+            backdrop_copy_pipeline_state,
+            backdrop_textures: None,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -749,9 +793,21 @@ impl MetalRenderer {
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
 
+        // Backdrop layers sample what was rendered before them, and a drawable can't be
+        // sampled, so frames with any render offscreen and are copied to `texture` at the end.
+        let backdrop_textures = if scene.backdrop_layers.is_empty() {
+            None
+        } else {
+            self.backdrop_textures(viewport_size)
+        };
+        let target: &metal::TextureRef = match &backdrop_textures {
+            Some(textures) => &textures.scene,
+            None => texture,
+        };
+
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
-            texture,
+            target,
             viewport_size,
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
@@ -777,7 +833,7 @@ impl MetalRenderer {
 
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
-                        texture,
+                        target,
                         viewport_size,
                         None,
                     );
@@ -820,13 +876,234 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::BackdropLayers(range) => {
+                    command_encoder.end_encoding();
+                    if let Some(textures) = &backdrop_textures {
+                        for layer in &scene.backdrop_layers[range] {
+                            self.draw_backdrop_layer(
+                                layer,
+                                textures,
+                                viewport_size,
+                                command_buffer,
+                            );
+                        }
+                    }
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        target,
+                        viewport_size,
+                        None,
+                    );
+                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
 
         command_encoder.end_encoding();
 
+        if let Some(textures) = &backdrop_textures {
+            self.run_backdrop_pass(
+                command_buffer,
+                &self.backdrop_copy_pipeline_state,
+                texture,
+                &textures.scene,
+                viewport_size,
+                None,
+                &BackdropParams::default(),
+                false,
+            );
+        }
+
         Ok(command_buffer.to_owned())
+    }
+
+    fn backdrop_textures(&mut self, viewport_size: Size<DevicePixels>) -> Option<BackdropTextures> {
+        let (width, height) = (viewport_size.width.0, viewport_size.height.0);
+        // Zero-sized texture creation aborts; see `update_path_intermediate_textures`.
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        let up_to_date = self.backdrop_textures.as_ref().is_some_and(|textures| {
+            textures.scene.width() == width as u64 && textures.scene.height() == height as u64
+        });
+        if !up_to_date {
+            let new_texture = |width: i32, height: i32| {
+                let descriptor = metal::TextureDescriptor::new();
+                descriptor.set_width(width.max(1) as u64);
+                descriptor.set_height(height.max(1) as u64);
+                descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+                descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+                descriptor.set_usage(
+                    metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+                );
+                self.device.new_texture(&descriptor)
+            };
+            self.backdrop_textures = Some(BackdropTextures {
+                scene: new_texture(width, height),
+                ping: new_texture(width / 2, height / 2),
+                pong: new_texture(width / 2, height / 2),
+            });
+        }
+        self.backdrop_textures.clone()
+    }
+
+    /// Blurs the scene behind `layer` at half resolution into `textures.ping`, then draws it
+    /// back into the scene through the layer's effect.
+    fn draw_backdrop_layer(
+        &self,
+        layer: &BackdropLayer,
+        textures: &BackdropTextures,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+    ) {
+        let half_size: Size<DevicePixels> = size(
+            (textures.ping.width() as i32).into(),
+            (textures.ping.height() as i32).into(),
+        );
+        let mut params = BackdropParams {
+            bounds: layer.bounds,
+            content_mask: layer.content_mask.bounds,
+            corner_radii: layer.corner_radii,
+            opacity: layer.opacity,
+            ..BackdropParams::default()
+        };
+        // How far outside its bounds the composite samples the backdrop.
+        let mut reach = 0.;
+        if let ScaledBackdropEffect::LiquidGlass {
+            refraction,
+            rim,
+            magnify,
+            aberration,
+            tint,
+            rim_tone,
+        } = layer.effect
+        {
+            let tint = Rgba::from(tint);
+            params.effect = 1.;
+            params.refraction = refraction.0;
+            params.rim = rim.0;
+            params.magnify = magnify;
+            params.aberration = aberration;
+            params.tint = [tint.r, tint.g, tint.b, tint.a];
+            params.rim_tone = rim_tone;
+            let half_extent = layer.bounds.size.width.0.max(layer.bounds.size.height.0) * 0.5;
+            let minified = if magnify < 1. {
+                (1. / magnify.max(0.01) - 1.) * half_extent
+            } else {
+                0.
+            };
+            reach = refraction.0 * (1. + aberration.abs()) + minified;
+        }
+
+        // Only the region the composite reads needs blurring; the extra 3 sigma keeps the
+        // blur from pulling in texels left over from earlier layers at the region's edge.
+        let region = layer
+            .bounds
+            .dilate(ScaledPixels(reach + 3. * layer.blur.0 + 2.));
+        let Some(scissor) = half_resolution_scissor(region, half_size) else {
+            return;
+        };
+
+        self.run_backdrop_pass(
+            command_buffer,
+            &self.backdrop_downsample_pipeline_state,
+            &textures.ping,
+            &textures.scene,
+            half_size,
+            Some(scissor),
+            &params,
+            false,
+        );
+
+        // Sigma is halved because the blur runs at half resolution.
+        let sigma = layer.blur.0 * 0.5;
+        if sigma > 0. {
+            // Span 3 sigma; past 32 taps, spread them out rather than truncating the kernel.
+            let ideal_taps = (3. * sigma).ceil();
+            params.blur_sigma = sigma;
+            params.blur_tap_count = ideal_taps.clamp(1., 32.);
+            params.blur_tap_step = (ideal_taps / params.blur_tap_count).max(1.);
+            params.blur_direction = [1. / i32::from(half_size.width) as f32, 0.];
+            self.run_backdrop_pass(
+                command_buffer,
+                &self.backdrop_blur_pipeline_state,
+                &textures.pong,
+                &textures.ping,
+                half_size,
+                Some(scissor),
+                &params,
+                false,
+            );
+            params.blur_direction = [0., 1. / i32::from(half_size.height) as f32];
+            self.run_backdrop_pass(
+                command_buffer,
+                &self.backdrop_blur_pipeline_state,
+                &textures.ping,
+                &textures.pong,
+                half_size,
+                Some(scissor),
+                &params,
+                false,
+            );
+        }
+
+        self.run_backdrop_pass(
+            command_buffer,
+            &self.backdrop_composite_pipeline_state,
+            &textures.scene,
+            &textures.ping,
+            viewport_size,
+            None,
+            &params,
+            true,
+        );
+    }
+
+    fn run_backdrop_pass(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        pipeline_state: &metal::RenderPipelineStateRef,
+        target: &metal::TextureRef,
+        source: &metal::TextureRef,
+        target_size: Size<DevicePixels>,
+        scissor: Option<metal::MTLScissorRect>,
+        params: &BackdropParams,
+        preserve_target: bool,
+    ) {
+        let clear_color = if preserve_target {
+            None
+        } else {
+            Some(metal::MTLClearColor::new(0., 0., 0., 0.))
+        };
+        let encoder =
+            new_command_encoder_for_texture(command_buffer, target, target_size, clear_color);
+        if let Some(scissor) = scissor {
+            encoder.set_scissor_rect(scissor);
+        }
+        encoder.set_render_pipeline_state(pipeline_state);
+        encoder.set_vertex_buffer(
+            BackdropInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        encoder.set_vertex_bytes(
+            BackdropInputIndex::Params as u64,
+            mem::size_of::<BackdropParams>() as u64,
+            params as *const BackdropParams as *const c_void,
+        );
+        encoder.set_vertex_bytes(
+            BackdropInputIndex::ViewportSize as u64,
+            mem::size_of_val(&target_size) as u64,
+            &target_size as *const Size<DevicePixels> as *const c_void,
+        );
+        encoder.set_fragment_bytes(
+            BackdropInputIndex::Params as u64,
+            mem::size_of::<BackdropParams>() as u64,
+            params as *const BackdropParams as *const c_void,
+        );
+        encoder.set_fragment_texture(0, Some(source));
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        encoder.end_encoding();
     }
 
     fn draw_paths_to_intermediate(
@@ -1398,6 +1675,130 @@ fn build_pipeline_state(
     device
         .new_render_pipeline_state(&descriptor)
         .expect("could not create render pipeline state")
+}
+
+/// Like `build_pipeline_state`, but blending is optional: the passes that copy, downsample and
+/// blur whole textures must replace pixels, not blend over them.
+fn build_backdrop_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    blending: bool,
+) -> metal::RenderPipelineState {
+    if blending {
+        return build_pipeline_state(
+            device,
+            library,
+            label,
+            vertex_fn_name,
+            fragment_fn_name,
+            MTLPixelFormat::BGRA8Unorm,
+        );
+    }
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+    color_attachment.set_blending_enabled(false);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
+/// The half-resolution pixels covering `region` (in full-resolution device pixels), or `None`
+/// if it's entirely off screen.
+fn half_resolution_scissor(
+    region: Bounds<ScaledPixels>,
+    half_size: Size<DevicePixels>,
+) -> Option<metal::MTLScissorRect> {
+    let (width, height) = (
+        i32::from(half_size.width) as f32,
+        i32::from(half_size.height) as f32,
+    );
+    let left = (region.origin.x.0 * 0.5).floor().clamp(0., width);
+    let top = (region.origin.y.0 * 0.5).floor().clamp(0., height);
+    let right = (region.right().0 * 0.5).ceil().clamp(0., width);
+    let bottom = (region.bottom().0 * 0.5).ceil().clamp(0., height);
+    (right > left && bottom > top).then(|| metal::MTLScissorRect {
+        x: left as u64,
+        y: top as u64,
+        width: (right - left) as u64,
+        height: (bottom - top) as u64,
+    })
+}
+
+/// Offscreen targets for frames with backdrop layers. The scene renders into `scene`, and each
+/// layer downsamples and blurs it through `ping` and `pong` at half resolution.
+#[derive(Clone)]
+struct BackdropTextures {
+    scene: metal::Texture,
+    ping: metal::Texture,
+    pong: metal::Texture,
+}
+
+/// Mirrors `BackdropParams` in `shaders.metal`, which reads it byte for byte through
+/// `set_vertex_bytes`/`set_fragment_bytes`, so field order and sizes must match. Every field
+/// after `blur_direction` is 4 bytes, which keeps both layouts free of padding.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BackdropParams {
+    bounds: Bounds<ScaledPixels>,
+    content_mask: Bounds<ScaledPixels>,
+    corner_radii: Corners<ScaledPixels>,
+    blur_direction: [f32; 2],
+    blur_sigma: f32,
+    blur_tap_count: f32,
+    blur_tap_step: f32,
+    opacity: f32,
+    /// 0 draws the blurred backdrop as is (frost), 1 through the liquid glass shader.
+    effect: f32,
+    refraction: f32,
+    rim: f32,
+    magnify: f32,
+    aberration: f32,
+    tint: [f32; 4],
+    rim_tone: f32,
+}
+
+impl Default for BackdropParams {
+    fn default() -> Self {
+        Self {
+            bounds: Bounds::default(),
+            content_mask: Bounds::default(),
+            corner_radii: Corners::default(),
+            blur_direction: [0., 0.],
+            blur_sigma: 0.,
+            blur_tap_count: 0.,
+            blur_tap_step: 1.,
+            opacity: 1.,
+            effect: 0.,
+            refraction: 0.,
+            rim: 0.,
+            magnify: 1.,
+            aberration: 0.,
+            tint: [0.; 4],
+            rim_tone: 0.,
+        }
+    }
+}
+
+#[repr(C)]
+enum BackdropInputIndex {
+    Vertices = 0,
+    Params = 1,
+    ViewportSize = 2,
 }
 
 fn build_path_sprite_pipeline_state(
