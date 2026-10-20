@@ -1,11 +1,11 @@
-# Merge Zed releases into the channel branches (see script/sync-upstream.py):
-#   daily        nightly <- Zed main, preview <- newest -pre tag
+# Merge Zed into the channel branches, then feed the fork's own branches (see script/sync-upstream.py):
+#   daily        nightly <- Zed main, preview <- newest -pre tag, then experimental <- nightly
 #   every 3 days main <- newest stable tag
-# A branch is pushed only if the merge is clean and `cargo check` + `cargo test -p gpui` pass;
-# otherwise the job fails and nothing is pushed for that branch.
+#   manual only  liquid-glass <- experimental (its stable line: promote when experimental is ready)
+# Each branch is synced by sync-branch.yml and pushed only if it builds and its tests pass.
 #
 # GITHUB_TOKEN cannot push commits that change .github/workflows, so workflow changes must be
-# merged into every channel branch by hand (never let a sync merge carry them).
+# merged into every branch by hand (never let a sync merge carry them).
 name: Sync upstream
 
 on:
@@ -16,9 +16,9 @@ on:
   workflow_dispatch:
     inputs:
       branches:
-        description: Channel branches to sync
+        description: Branches to sync (all = the three channels, then experimental)
         type: choice
-        options: [all, nightly, preview, main]
+        options: [all, nightly, preview, main, experimental, liquid-glass]
         default: all
 
 permissions:
@@ -27,10 +27,6 @@ permissions:
 concurrency:
   group: sync-upstream
   cancel-in-progress: false
-
-env:
-  CARGO_TERM_COLOR: always
-  FILTER_REPO_VERSION: "2.47.0"
 
 jobs:
   plan:
@@ -57,98 +53,18 @@ jobs:
 
   sync:
     needs: plan
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         branch: ${{ fromJSON(needs.plan.outputs.branches) }}
-    env:
-      BRANCH: ${{ matrix.branch }}
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          fetch-depth: 0
+    uses: ./.github/workflows/sync-branch.yml
+    with:
+      branch: ${{ matrix.branch }}
 
-      - name: Prepare git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          # the sync script works on local channel branches; preview is also needed when syncing main
-          git checkout --quiet --detach
-          for b in nightly preview main; do
-            if git rev-parse --verify --quiet "refs/remotes/origin/$b" >/dev/null; then
-              git branch --force "$b" "origin/$b"
-            fi
-          done
-          echo "BEFORE=$(git rev-parse --verify --quiet "refs/heads/$BRANCH" || true)" >> "$GITHUB_ENV"
-          echo "ZED_UPSTREAM=$HOME/zed-upstream" >> "$GITHUB_ENV"
-          echo "DAY=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
-
-      - name: Install git-filter-repo
-        # must match FILTER_REPO_VERSION in script/sync-upstream.py, or hashes change
-        run: pipx install "git-filter-repo==$FILTER_REPO_VERSION"
-
-      - name: Restore Zed clone
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/zed-upstream
-          key: zed-upstream-${{ env.DAY }}
-          restore-keys: zed-upstream-
-
-      - name: Merge upstream into ${{ matrix.branch }}
-        id: sync
-        run: |
-          python3 script/sync-upstream.py update "$BRANCH"
-          if [ "$(git rev-parse "refs/heads/$BRANCH")" = "$BEFORE" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "$BRANCH: already up to date" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Install build dependencies
-        if: steps.sync.outputs.changed == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang cmake libasound2-dev libfontconfig-dev libglib2.0-dev libssl-dev \
-            libvulkan1 libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libzstd-dev
-
-      - name: Restore Cargo cache
-        if: steps.sync.outputs.changed == 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ matrix.branch }}-${{ github.run_id }}
-          restore-keys: cargo-${{ matrix.branch }}-
-
-      - name: Check and test
-        if: steps.sync.outputs.changed == 'true'
-        run: |
-          git checkout --quiet "$BRANCH"
-          rustup toolchain install
-          cargo check --workspace --all-targets
-          cargo test -p gpui
-          # the merge must have committed the generated Cargo.toml / Cargo.lock as cargo wants them
-          git diff --exit-code
-
-      - name: Push
-        if: steps.sync.outputs.changed == 'true'
-        run: |
-          git push origin "refs/heads/$BRANCH:refs/heads/$BRANCH"
-          # nightly merges no release tags; preview/main publish the zed-* tags they build on
-          # (retry once: parallel preview/main jobs may race to create the same tags)
-          if [ "$BRANCH" != nightly ]; then
-            git push origin 'refs/tags/zed-*:refs/tags/zed-*' || git push origin 'refs/tags/zed-*:refs/tags/zed-*'
-          fi
-          {
-            echo "$BRANCH: $(git log -1 --format='%h %s' "$BRANCH")"
-            echo
-            echo '```'
-            python3 script/sync-upstream.py status
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+  # after nightly is pushed, so experimental merges the nightly that passed its checks
+  experimental:
+    needs: [plan, sync]
+    if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.branches), 'nightly') }}
+    uses: ./.github/workflows/sync-branch.yml
+    with:
+      branch: experimental
