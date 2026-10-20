@@ -2136,6 +2136,10 @@ impl PlatformWindow for MacWindow {
         None
     }
 
+    fn gpu_frame_stats(&self) -> Option<gpui::GpuFrameStats> {
+        self.0.lock().renderer.gpu_frame_stats()
+    }
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
         let executor = self.0.lock().foreground_executor.clone();
         executor

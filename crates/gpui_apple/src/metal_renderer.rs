@@ -1,3 +1,4 @@
+use crate::gpu_timer::{self, GpuTimer};
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
@@ -133,6 +134,7 @@ pub struct MetalRenderer {
     backdrop_copy_pipeline_state: metal::RenderPipelineState,
     /// Created the first time a frame has backdrop layers, and resized with the viewport.
     backdrop_textures: Option<BackdropTextures>,
+    gpu_timer: GpuTimer,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -471,6 +473,7 @@ impl MetalRenderer {
             backdrop_composite_pipeline_state,
             backdrop_copy_pipeline_state,
             backdrop_textures: None,
+            gpu_timer: GpuTimer::default(),
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -561,6 +564,11 @@ impl MetalRenderer {
         // nothing to do
     }
 
+    /// GPU timing of the last completed frame; the first call turns timing on.
+    pub fn gpu_frame_stats(&mut self) -> Option<gpui::GpuFrameStats> {
+        self.gpu_timer.stats(&self.device)
+    }
+
     pub fn draw(&mut self, scene: &Scene) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
@@ -627,6 +635,8 @@ impl MetalRenderer {
                 scene.surfaces.len(),
             )
         })?;
+        self.gpu_timer
+            .begin_frame(&self.device, scene.backdrop_layers.len());
         let command_buffer = self.draw_primitives_to_texture(
             scene,
             &instance_bindings,
@@ -634,6 +644,7 @@ impl MetalRenderer {
             texture,
             viewport_size,
         )?;
+        self.gpu_timer.end_frame(&self.device, &command_buffer);
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
@@ -1075,8 +1086,21 @@ impl MetalRenderer {
         } else {
             Some(metal::MTLClearColor::new(0., 0., 0., 0.))
         };
-        let encoder =
-            new_command_encoder_for_texture(command_buffer, target, target_size, clear_color);
+        let pass = if ptr::eq(pipeline_state, &*self.backdrop_copy_pipeline_state) {
+            gpu_timer::Pass::BackdropCopy
+        } else if ptr::eq(pipeline_state, &*self.backdrop_composite_pipeline_state) {
+            gpu_timer::Pass::BackdropComposite
+        } else {
+            gpu_timer::Pass::BackdropBlur
+        };
+        let encoder = gpu_timer::new_timed_command_encoder(
+            &self.gpu_timer,
+            pass,
+            command_buffer,
+            target,
+            target_size,
+            clear_color,
+        );
         if let Some(scissor) = scissor {
             encoder.set_scissor_rect(scissor);
         }

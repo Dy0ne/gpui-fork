@@ -1355,6 +1355,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
+    /// GPU timing of the last completed frame; renderers that measure it start doing so on the
+    /// first call.
+    fn gpu_frame_stats(&self) -> Option<crate::GpuFrameStats> {
+        None
+    }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
