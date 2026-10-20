@@ -51,6 +51,9 @@ FORK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(FORK, "script")
 UPSTREAM_URL = "https://github.com/zed-industries/zed.git"
 UPSTREAM_TAGS = ("refs/tags/v*:refs/tags/v*", "refs/tags/gpui-v*:refs/tags/gpui-v*")
+# Commit hashes are only stable across runs of the same filter-repo release, so every machine
+# (and CI) must run this one. `git filter-repo --version` prints this for 2.47.0.
+FILTER_REPO_VERSION = "a40bce548d2c"
 GENERATED = ("Cargo.toml", "Cargo.lock")
 VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(-pre)?$")
 # channel branch -> whether it follows -pre tags (None: follows Zed main)
@@ -129,6 +132,12 @@ def require_clean():
 
 
 def fetch():
+    version = run("git", "filter-repo", "--version", check=False).stdout.strip()
+    if version != FILTER_REPO_VERSION:
+        sys.exit(
+            f"git filter-repo {version or '(not installed)'} found, need {FILTER_REPO_VERSION} (2.47.0): "
+            "another release may produce different hashes and break merging"
+        )
     upstream = upstream_dir()
     if not os.path.isdir(os.path.join(upstream, ".git")):
         print(f"cloning {UPSTREAM_URL} into {upstream} ...")
@@ -172,7 +181,13 @@ def fetch():
         subprocess.run(["git", "update-ref", "--stdin"], input="\n".join(created) + "\n", text=True, cwd=FORK, check=True)
     print(f"zed-* tags: {len(created)} new, {len(existing) + len(created)} total")
     if rewritten:
-        print(f"warning: upstream moved these tags, local zed-* tags left untouched: {', '.join(rewritten)}")
+        # either upstream moved a release tag, or filtering stopped being deterministic (different
+        # filter-repo, edited stream file); merging now could duplicate the whole history
+        sys.exit(
+            f"filtered commits no longer match existing zed-* tags: {', '.join(rewritten[:10])}"
+            + (" ..." if len(rewritten) > 10 else "")
+            + "\nIf upstream really moved these tags, delete the local zed-* tags and fetch again."
+        )
 
 
 def regenerate(upstream_rev):
