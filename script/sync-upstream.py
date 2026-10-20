@@ -24,7 +24,9 @@ Refs in this repo:
   refs/zed/<stream>/main, refs/zed/<stream>/tags/<tag>  filtered upstream, per stream
   tags zed-<tag>                                          same commits as refs/zed/<first stream>/tags/<tag>
   tags vX.Y.Z[-pre][-fork.N]                              fork releases, created by `tag`
-  tag fork-base                                           fork-only root commit new channel branches start from
+
+Channel branches share one fork-only root commit (the first-parent root of each branch,
+upstream always comes in as a second parent); a missing channel branch is recreated from it.
 
 Usage:
   script/sync-upstream.py fetch                       refresh the Zed clone and refs/zed/*
@@ -49,7 +51,6 @@ FORK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(FORK, "script")
 UPSTREAM_URL = "https://github.com/zed-industries/zed.git"
 UPSTREAM_TAGS = ("refs/tags/v*:refs/tags/v*", "refs/tags/gpui-v*:refs/tags/gpui-v*")
-FORK_BASE = "fork-base"
 GENERATED = ("Cargo.toml", "Cargo.lock")
 VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(-pre)?$")
 # channel branch -> whether it follows -pre tags (None: follows Zed main)
@@ -112,6 +113,14 @@ def based_on(branch, pre):
     versions = {n[len("zed-") :]: parse_version(n[len("zed-") :]) for n in names}
     versions = {name: v for name, v in versions.items() if v and v[3] == pre}
     return max(versions, key=versions.get) if versions else None
+
+
+def fork_root():
+    """The fork-only root commit, found as the first-parent root of any existing channel branch."""
+    for branch in CHANNELS:
+        if ref_exists(f"refs/heads/{branch}"):
+            return git("rev-list", "--first-parent", "--max-parents=0", branch).splitlines()[0]
+    return None
 
 
 def require_clean():
@@ -227,9 +236,10 @@ def update_branch(branch, target=None):
         upstream_rev, label = f"refs/tags/{target}", f"zed {target}"
 
     if not ref_exists(f"refs/heads/{branch}"):
-        if not ref_exists(FORK_BASE):
-            sys.exit(f"branch {branch} does not exist and there is no `{FORK_BASE}` tag to create it from")
-        git("branch", branch, FORK_BASE)
+        root = fork_root()
+        if root is None:
+            sys.exit(f"branch {branch} does not exist and there is no other channel branch to find the fork root from")
+        git("branch", branch, root)
     git("checkout", "--quiet", branch)
 
     merges = []
