@@ -7,7 +7,7 @@ cargo run -p liquid_glass --release
 LIQUID_GLASS=cpu cargo run -p liquid_glass --release   # start on the CPU renderer
 ```
 
-Use `--release`: the CPU renderer shades every glass pixel each frame and stutters in a debug build.
+The demo crate is built at `opt-level = 3` even in dev builds (`[package.metadata.profile.dev]` in its `Cargo.toml`), because the CPU renderer shades every glass pixel each frame and drops to a few fps unoptimized. `--release` is optional.
 
 ## Two renderers
 
