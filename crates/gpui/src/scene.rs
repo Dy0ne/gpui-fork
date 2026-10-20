@@ -50,6 +50,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub backdrop_layers: Vec<BackdropLayer>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +67,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.backdrop_layers.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -133,6 +135,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::BackdropLayer(layer) => {
+                layer.order = order;
+                self.backdrop_layers.push(*layer);
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -160,6 +166,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.backdrop_layers.sort_by_key(|layer| layer.order);
     }
 
     #[cfg_attr(
@@ -187,6 +194,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            backdrop_layers_start: 0,
+            backdrop_layers_iter: self.backdrop_layers.iter().peekable(),
         }
     }
 }
@@ -209,6 +218,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    BackdropLayer,
 }
 
 pub(crate) enum PaintOperation {
@@ -228,6 +238,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    BackdropLayer(BackdropLayer),
 }
 
 #[expect(missing_docs)]
@@ -242,6 +253,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::BackdropLayer(layer) => &layer.bounds,
         }
     }
 
@@ -255,6 +267,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::BackdropLayer(layer) => &layer.content_mask,
         }
     }
 }
@@ -283,6 +296,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    backdrop_layers_start: usize,
+    backdrop_layers_iter: Peekable<slice::Iter<'a, BackdropLayer>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -315,6 +330,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.backdrop_layers_iter.peek().map(|layer| layer.order),
+                PrimitiveKind::BackdropLayer,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -461,6 +480,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::BackdropLayer => {
+                let layers_start = self.backdrop_layers_start;
+                let mut layers_end = layers_start + 1;
+                self.backdrop_layers_iter.next();
+                while self
+                    .backdrop_layers_iter
+                    .next_if(|layer| (layer.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    layers_end += 1;
+                }
+                self.backdrop_layers_start = layers_end;
+                Some(PrimitiveBatch::BackdropLayers(layers_start..layers_end))
+            }
         }
     }
 }
@@ -493,6 +526,9 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    /// Each layer reads back what was painted before it, so a renderer has to finish every
+    /// earlier batch before drawing one.
+    BackdropLayers(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -525,6 +561,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::BackdropLayers(range) => format!("backdrop layers ({})", range.len()),
         }
     }
 }
@@ -776,6 +813,87 @@ pub struct PaintSurface {
 impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
+    }
+}
+
+/// A layer that takes what has already been painted behind `bounds`, blurs it, and draws it
+/// back into the rounded rect through `effect`. Emitted by [`crate::Window::paint_backdrop_layer`].
+#[derive(Clone, Copy, Debug)]
+#[expect(missing_docs)]
+pub struct BackdropLayer {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Gaussian sigma of the blur applied to the backdrop before the effect.
+    pub blur: ScaledPixels,
+    pub effect: ScaledBackdropEffect,
+    pub opacity: f32,
+}
+
+impl From<BackdropLayer> for Primitive {
+    fn from(layer: BackdropLayer) -> Self {
+        Primitive::BackdropLayer(layer)
+    }
+}
+
+/// How a backdrop layer draws its blurred backdrop.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum BackdropEffect {
+    /// The blurred backdrop as is: frosted glass.
+    Frost,
+    /// The blurred backdrop bent, magnified, tinted and lit like a thick glass lens.
+    LiquidGlass(LiquidGlass),
+}
+
+/// Optical parameters of [`BackdropEffect::LiquidGlass`]. Lengths are in logical pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct LiquidGlass {
+    /// How far the very edge shows the backdrop from outside itself; the shift falls off to
+    /// zero across the rim.
+    pub refraction: Pixels,
+    /// Width of the curved rim. It is capped at the corner radius, where the edge normal stays
+    /// continuous.
+    pub rim: Pixels,
+    /// Magnification of the backdrop around the layer's center; 1.0 is none.
+    pub magnify: f32,
+    /// Per-channel spread of the refraction, for color fringes at the rim; 0.0 is none.
+    pub aberration: f32,
+    /// Mixed over the backdrop by its alpha.
+    pub tint: Hsla,
+    /// Rim light color and strength: 1.0 is white, 0.0 none, -1.0 black.
+    pub rim_tone: f32,
+}
+
+/// [`BackdropEffect`] with its lengths in scaled (device) pixels, as stored in the scene.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[expect(missing_docs)]
+pub enum ScaledBackdropEffect {
+    Frost,
+    LiquidGlass {
+        refraction: ScaledPixels,
+        rim: ScaledPixels,
+        magnify: f32,
+        aberration: f32,
+        tint: Hsla,
+        rim_tone: f32,
+    },
+}
+
+impl BackdropEffect {
+    /// Converts the effect's lengths to scaled pixels.
+    pub fn scale(&self, factor: f32) -> ScaledBackdropEffect {
+        match *self {
+            BackdropEffect::Frost => ScaledBackdropEffect::Frost,
+            BackdropEffect::LiquidGlass(glass) => ScaledBackdropEffect::LiquidGlass {
+                refraction: glass.refraction.scale(factor),
+                rim: glass.rim.scale(factor),
+                magnify: glass.magnify,
+                aberration: glass.aberration,
+                tint: glass.tint,
+                rim_tone: glass.rim_tone,
+            },
+        }
     }
 }
 

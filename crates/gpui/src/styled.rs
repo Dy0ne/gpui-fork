@@ -1,9 +1,10 @@
 use crate::{
-    self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
-    DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
-    FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
-    TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
+    self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BackdropEffect,
+    BackdropStyle, BorderStyle, CursorStyle, DefiniteLength, Display, Fill, FlexDirection,
+    FlexWrap, Font, FontFeatures, FontStyle, FontWeight, GridPlacement, GridTemplate,
+    GridTemplateMinSize, Hsla, JustifyContent, Length, Pixels, SharedString, StrikethroughStyle,
+    StyleRefinement, TextAlign, TextOverflow, TextStyleRefinement, UnderlineStyle, WhiteSpace, px,
+    relative, rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -745,6 +746,16 @@ pub trait Styled: Sized {
     /// Sets the opacity of this element and its children.
     fn opacity(mut self, opacity: f32) -> Self {
         self.style().opacity = Some(opacity);
+        self
+    }
+
+    /// Draws everything painted behind this element blurred by `blur` and through `effect`,
+    /// inside its rounded corners. Only the Metal renderer (macOS and iOS) draws it.
+    fn backdrop(mut self, blur: impl Into<Pixels>, effect: BackdropEffect) -> Self {
+        self.style().backdrop = Some(BackdropStyle {
+            blur: blur.into(),
+            effect,
+        });
         self
     }
 

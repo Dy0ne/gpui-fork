@@ -385,6 +385,8 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                // Backdrop layers are only implemented by the Metal renderer.
+                PrimitiveBatch::BackdropLayers(_) => Ok(()),
             }
             .with_context(|| {
                 format!(

@@ -5189,6 +5189,40 @@ impl Window {
         });
     }
 
+    /// Paint a backdrop layer into the scene for the next frame at the current z-index. The
+    /// renderer blurs what has already been painted behind `bounds` by `blur` (a Gaussian
+    /// sigma) and draws it back into the rounded rect through `effect`. Paint it before the
+    /// element's own content, which then sits on top of the glass.
+    ///
+    /// Only the Metal renderer (macOS and iOS) draws backdrop layers; others skip them.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_backdrop_layer(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur: Pixels,
+        effect: crate::BackdropEffect,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
+        self.next_frame
+            .scene
+            .insert_primitive(crate::BackdropLayer {
+                order: 0,
+                bounds,
+                content_mask,
+                corner_radii: corner_radii.scale(scale_factor),
+                blur: blur.scale(scale_factor),
+                effect: effect.scale(scale_factor),
+                opacity,
+            });
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {
