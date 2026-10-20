@@ -1,0 +1,125 @@
+# Sync one branch with script/sync-upstream.py, called by sync-upstream.yml.
+# The branch is pushed only if the merge is clean and `cargo check` + `cargo test -p gpui` pass;
+# otherwise the job fails and nothing is pushed.
+name: Sync branch
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: nightly, preview, main, experimental or liquid-glass
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  FILTER_REPO_VERSION: "2.47.0"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      BRANCH: ${{ inputs.branch }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Prepare git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          # the sync script works on local branches: main needs preview, downstream branches need their source
+          git checkout --quiet --detach
+          for b in nightly preview main experimental liquid-glass; do
+            if git rev-parse --verify --quiet "refs/remotes/origin/$b" >/dev/null; then
+              git branch --force "$b" "origin/$b"
+            fi
+          done
+          echo "BEFORE=$(git rev-parse --verify --quiet "refs/heads/$BRANCH" || true)" >> "$GITHUB_ENV"
+          echo "ZED_UPSTREAM=$HOME/zed-upstream" >> "$GITHUB_ENV"
+          echo "DAY=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Install git-filter-repo
+        # must match FILTER_REPO_VERSION in script/sync-upstream.py, or hashes change
+        run: pipx install "git-filter-repo==$FILTER_REPO_VERSION"
+
+      - name: Restore Zed clone
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/zed-upstream
+          key: zed-upstream-${{ env.DAY }}
+          restore-keys: zed-upstream-
+
+      - name: Update the Zed clone
+        # downstream branches don't fetch through the script, but regenerating their manifest
+        # reads the upstream revision their source was generated from
+        if: inputs.branch == 'experimental' || inputs.branch == 'liquid-glass'
+        run: |
+          if [ -d "$ZED_UPSTREAM/.git" ]; then
+            git -C "$ZED_UPSTREAM" pull --quiet --ff-only --no-tags origin main
+            git -C "$ZED_UPSTREAM" fetch --quiet --no-tags origin 'refs/tags/v*:refs/tags/v*'
+          else
+            git clone --quiet --single-branch --branch main --no-tags https://github.com/zed-industries/zed.git "$ZED_UPSTREAM"
+          fi
+
+      - name: Merge into ${{ inputs.branch }}
+        id: sync
+        run: |
+          python3 script/sync-upstream.py update "$BRANCH"
+          if [ "$(git rev-parse "refs/heads/$BRANCH")" = "$BEFORE" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "$BRANCH: already up to date" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install build dependencies
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libasound2-dev libfontconfig-dev libglib2.0-dev libssl-dev \
+            libvulkan1 libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libzstd-dev
+
+      - name: Restore Cargo cache
+        if: steps.sync.outputs.changed == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ inputs.branch }}-${{ github.run_id }}
+          restore-keys: cargo-${{ inputs.branch }}-
+
+      - name: Check and test
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          git checkout --quiet "$BRANCH"
+          rustup toolchain install
+          cargo check --workspace --all-targets
+          cargo test -p gpui
+          # the merge must have committed the generated Cargo.toml / Cargo.lock as cargo wants them
+          git diff --exit-code
+
+      - name: Push
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          git push origin "refs/heads/$BRANCH:refs/heads/$BRANCH"
+          # preview/main publish the zed-* release tags they build on
+          # (retry once: parallel preview/main jobs may race to create the same tags)
+          if [ "$BRANCH" = preview ] || [ "$BRANCH" = main ]; then
+            git push origin 'refs/tags/zed-*:refs/tags/zed-*' || git push origin 'refs/tags/zed-*:refs/tags/zed-*'
+          fi
+          {
+            echo "$BRANCH: $(git log -1 --format='%h %s' "$BRANCH")"
+            echo
+            echo '```'
+            python3 script/sync-upstream.py status
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
