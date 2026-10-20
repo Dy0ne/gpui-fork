@@ -971,6 +971,7 @@ impl Render for Demo {
         self.perf.frame(Instant::now());
         // The first call turns GPU timing on; Metal only.
         self.perf.gpu_frame(window.gpu_frame_stats());
+        self.perf.log(Instant::now());
 
         let theme = self.theme();
         let backdrop = Rc::new(Backdrop::animated(

@@ -43,6 +43,9 @@ pub struct Perf {
     pub threads: Option<u32>,
     /// `None` until the first measured frame completes, and on renderers that don't measure.
     pub gpu: Option<GpuTimes>,
+    /// Set by `LIQUID_GLASS_STATS=1`: print the panel's numbers once a second, for scripts.
+    log: bool,
+    last_log: Option<Instant>,
 }
 
 impl Perf {
@@ -57,7 +60,34 @@ impl Perf {
             memory_bytes: None,
             threads: None,
             gpu: None,
+            log: std::env::var("LIQUID_GLASS_STATS").is_ok_and(|value| value == "1"),
+            last_log: None,
         }
+    }
+
+    /// Prints the current numbers on one line, at most once a second, if logging is on.
+    pub fn log(&mut self, now: Instant) {
+        if !self.log
+            || self
+                .last_log
+                .is_some_and(|at| now - at < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_log = Some(now);
+        let frame = self.frame_avg_max().map_or(0., |(avg, _)| avg);
+        let gpu = self.gpu.map_or(String::new(), |gpu| {
+            format!(
+                " gpu_ms={:.3} blur_ms={:.3} lens_ms={:.3} copy_ms={:.3} layers={}",
+                gpu.frame_ms, gpu.blur_ms, gpu.composite_ms, gpu.copy_ms, gpu.layers
+            )
+        });
+        let cpu = self.cpu_percent.unwrap_or(0.);
+        println!(
+            "fps={:.0} frame_ms={frame:.2} glass_cpu_ms={:.3}{gpu} cpu={cpu:.0}",
+            self.fps(),
+            self.glass_ms
+        );
     }
 
     /// Records the GPU timing of the last completed frame.
