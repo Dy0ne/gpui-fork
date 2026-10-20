@@ -1,0 +1,15 @@
+[package]
+name = "liquid_glass"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Liquid glass demo for GPUI's backdrop layers"
+license = "Apache-2.0"
+
+[dependencies]
+# by path rather than the workspace entries, which turn GPUI's default features off
+gpui = { path = "../../crates/gpui" }
+gpui_platform = { path = "../../crates/gpui_platform", features = ["font-kit", "wayland", "x11"] }
+image.workspace = true
+libc.workspace = true
+rayon.workspace = true
