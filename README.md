@@ -9,13 +9,17 @@
 
 ### Branches
 
-The branches follow Zed's release channels:
+The channel branches follow Zed's release channels; the fork's own features flow downstream from `nightly`:
 
-| Branch    | Tracks                                    | Use it for                                                  |
-| --------- | ----------------------------------------- | ----------------------------------------------------------- |
-| `main`    | newest Zed stable release (`vX.Y.Z`)      | apps — the default                                          |
-| `preview` | newest Zed preview release (`vX.Y.Z-pre`) | trying the next release early; fork patches land here first |
-| `nightly` | Zed `main`                                | catching upstream breakage early; may be unstable           |
+| Branch         | Tracks                                    | Use it for                                                    |
+| -------------- | ----------------------------------------- | ------------------------------------------------------------- |
+| `main`         | newest Zed stable release (`vX.Y.Z`)      | apps — the default                                            |
+| `preview`      | newest Zed preview release (`vX.Y.Z-pre`) | trying the next release early; fork patches land here first   |
+| `nightly`      | Zed `main`                                | catching upstream breakage early; may be unstable             |
+| `experimental` | `nightly` + the fork's features           | developing [liquid glass](#liquid-glass) and other features   |
+| `liquid-glass` | `experimental`, promoted by hand          | the stable line of liquid glass — use this to build on it     |
+
+`nightly`, `preview` and `experimental` are synced automatically every day and `main` every three days, each only after it builds and its tests pass.
 
 ### Tags
 
@@ -56,6 +60,38 @@ gpui_platform.workspace = true
 ```
 
 Cargo applies `[patch.crates-io]` only from the top-level workspace. This repo patches several crates with Zed's forks (`async-task`, `calloop`, `async-process`, `khronos-egl`, …), so **copy the `[patch.crates-io]` section of this repo's `Cargo.toml`, at the tag you depend on, into your own workspace's `Cargo.toml`**. Without it you get the crates.io versions, which may fail to compile or behave differently. To match upstream builds exactly, also copy the `rustflags` and `[env]` from `.cargo/config.toml`.
+
+### Liquid glass
+
+On `experimental` and `liquid-glass`, GPUI has backdrop layers. `Styled::backdrop(blur, effect)` takes everything painted behind an element, blurs it and draws it back inside the element's rounded corners through a `BackdropEffect`, so the glass refracts text, images and other glass too:
+
+```rust
+use gpui::{BackdropEffect, LiquidGlass, div, hsla, prelude::*, px};
+
+div()
+    .size(px(200.))
+    .rounded(px(28.))
+    .backdrop(
+        px(6.), // Gaussian blur sigma
+        BackdropEffect::LiquidGlass(LiquidGlass {
+            refraction: px(11.), // how far outside its edge the rim shows the backdrop from
+            rim: px(22.),        // width of the curved rim, capped at the corner radius
+            magnify: 1.,
+            aberration: 0.08,    // color fringes at the rim
+            tint: hsla(0., 0., 1., 0.08),
+            rim_tone: 0.5,       // rim light: 1 white, 0 none, -1 black
+        }),
+    )
+```
+
+`BackdropEffect::Frost` is plain frosted glass. A layer sees only what was painted before it, so give it a translucent background and put its content in children, which paint on top. Only the Metal renderer (macOS and iOS) draws backdrop layers; on Linux, Windows and the web they are skipped and the element shows just its background.
+
+[`examples/liquid_glass`](examples/liquid_glass) is a complete demo: draggable glass panels (navigation bar, dock, lens, control and stats cards) that squash and stretch while dragged, over an animated scene, with live controls for blur, refraction, magnification, tint and rim light, light and dark themes, and a performance panel. It has two renderers, switchable from the control card: the Metal backdrop layer, and a CPU renderer that shades the glass per pixel and works on every platform.
+
+```sh
+cargo run -p liquid_glass --release
+LIQUID_GLASS=cpu cargo run -p liquid_glass --release   # start on the CPU renderer
+```
 
 The rest of this README is GPUI's own documentation (`crates/gpui/README.md`), with the install snippet and links adjusted for this repo.
 
