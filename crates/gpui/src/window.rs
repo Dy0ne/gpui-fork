@@ -7005,6 +7005,13 @@ impl Window {
         self.platform_window.gpu_specs()
     }
 
+    /// GPU time spent on this window's most recently completed frame, including its backdrop
+    /// layers. Timing starts with the first call, so it returns `None` until a frame after that
+    /// completes, and always on renderers that don't measure it (only Metal does).
+    pub fn gpu_frame_stats(&self) -> Option<crate::GpuFrameStats> {
+        self.platform_window.gpu_frame_stats()
+    }
+
     /// Perform titlebar double-click action.
     /// This is macOS specific.
     pub fn titlebar_double_click(&self) {

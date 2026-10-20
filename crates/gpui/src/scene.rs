@@ -897,6 +897,22 @@ impl BackdropEffect {
     }
 }
 
+/// GPU time spent on the most recently completed frame of a window, from
+/// [`crate::Window::gpu_frame_stats`]. Only the Metal renderer measures it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GpuFrameStats {
+    /// From the start to the end of the frame's work on the GPU.
+    pub frame: std::time::Duration,
+    /// Blurring the backdrop of every layer: a downsample and two blur passes each.
+    pub backdrop_blur: std::time::Duration,
+    /// Drawing the blurred backdrop of every layer back through its effect.
+    pub backdrop_composite: std::time::Duration,
+    /// Copying the offscreen frame to the window, which only frames with backdrop layers pay.
+    pub backdrop_copy: std::time::Duration,
+    /// How many backdrop layers the frame drew.
+    pub backdrop_layer_count: usize,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[expect(missing_docs)]
 pub struct PathId(pub usize);

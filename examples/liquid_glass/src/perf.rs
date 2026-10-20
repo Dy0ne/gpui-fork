@@ -4,7 +4,21 @@ use std::{
     time::{Duration, Instant},
 };
 
+use gpui::GpuFrameStats;
+
 use crate::glass;
+
+/// Smoothed GPU time per frame, in milliseconds, from `Window::gpu_frame_stats`.
+#[derive(Clone, Copy)]
+pub struct GpuTimes {
+    pub frame_ms: f32,
+    /// What the Metal glass costs: blurring its backdrop, then drawing it through the lens.
+    pub blur_ms: f32,
+    pub composite_ms: f32,
+    /// Copying the offscreen frame to the window, paid by every frame with glass.
+    pub copy_ms: f32,
+    pub layers: usize,
+}
 
 /// Frame intervals longer than this are idle gaps, not slow frames.
 const IDLE_GAP: Duration = Duration::from_millis(250);
@@ -27,6 +41,11 @@ pub struct Perf {
     pub cpu_percent: Option<f32>,
     pub memory_bytes: Option<u64>,
     pub threads: Option<u32>,
+    /// `None` until the first measured frame completes, and on renderers that don't measure.
+    pub gpu: Option<GpuTimes>,
+    /// Set by `LIQUID_GLASS_STATS=1`: print the panel's numbers once a second, for scripts.
+    log: bool,
+    last_log: Option<Instant>,
 }
 
 impl Perf {
@@ -40,7 +59,56 @@ impl Perf {
             cpu_percent: None,
             memory_bytes: None,
             threads: None,
+            gpu: None,
+            log: std::env::var("LIQUID_GLASS_STATS").is_ok_and(|value| value == "1"),
+            last_log: None,
         }
+    }
+
+    /// Prints the current numbers on one line, at most once a second, if logging is on.
+    pub fn log(&mut self, now: Instant) {
+        if !self.log
+            || self
+                .last_log
+                .is_some_and(|at| now - at < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_log = Some(now);
+        let frame = self.frame_avg_max().map_or(0., |(avg, _)| avg);
+        let gpu = self.gpu.map_or(String::new(), |gpu| {
+            format!(
+                " gpu_ms={:.3} blur_ms={:.3} lens_ms={:.3} copy_ms={:.3} layers={}",
+                gpu.frame_ms, gpu.blur_ms, gpu.composite_ms, gpu.copy_ms, gpu.layers
+            )
+        });
+        let cpu = self.cpu_percent.unwrap_or(0.);
+        println!(
+            "fps={:.0} frame_ms={frame:.2} glass_cpu_ms={:.3}{gpu} cpu={cpu:.0}",
+            self.fps(),
+            self.glass_ms
+        );
+    }
+
+    /// Records the GPU timing of the last completed frame.
+    pub fn gpu_frame(&mut self, stats: Option<GpuFrameStats>) {
+        let Some(stats) = stats else {
+            return;
+        };
+        let ms = |time: Duration| time.as_secs_f32() * 1000.;
+        let latest = GpuTimes {
+            frame_ms: ms(stats.frame),
+            blur_ms: ms(stats.backdrop_blur),
+            composite_ms: ms(stats.backdrop_composite),
+            copy_ms: ms(stats.backdrop_copy),
+            layers: stats.backdrop_layer_count,
+        };
+        let gpu = self.gpu.get_or_insert(latest);
+        gpu.frame_ms += (latest.frame_ms - gpu.frame_ms) * 0.1;
+        gpu.blur_ms += (latest.blur_ms - gpu.blur_ms) * 0.1;
+        gpu.composite_ms += (latest.composite_ms - gpu.composite_ms) * 0.1;
+        gpu.copy_ms += (latest.copy_ms - gpu.copy_ms) * 0.1;
+        gpu.layers = latest.layers;
     }
 
     /// Records a frame rendered at `now`.

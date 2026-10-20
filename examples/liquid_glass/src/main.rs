@@ -152,7 +152,7 @@ impl Demo {
                 Panel::new(Kind::Controls, 32., 296., 300., 408., 28.),
                 Panel::new(Kind::Dock, 380., 612., 400., 80., 30.),
                 Panel::new(Kind::Lens, 640., 220., 180., 180., 90.),
-                Panel::new(Kind::Stats, 846., 24., 230., 304., 24.),
+                Panel::new(Kind::Stats, 846., 24., 230., 352., 24.),
             ],
             drag: None,
             drag_moved: false,
@@ -761,6 +761,24 @@ impl Demo {
             }
         });
         let threads = self.perf.threads.map_or("—".into(), |n| n.to_string());
+        let gpu_frame = self.perf.gpu.map_or("—".into(), |gpu| {
+            format!("{:.2} ms · copy {:.2}", gpu.frame_ms, gpu.copy_ms)
+        });
+        let glass = match (self.renderer, self.perf.gpu) {
+            (GlassRenderer::Gpu, Some(gpu)) => format!(
+                "{:.2} ms GPU ({} layers)",
+                gpu.blur_ms + gpu.composite_ms,
+                gpu.layers
+            ),
+            (GlassRenderer::Gpu, None) => "Metal shader".into(),
+            (GlassRenderer::Cpu, _) => format!("{:.1} ms CPU", self.perf.glass_ms),
+        };
+        let glass_split = match (self.renderer, self.perf.gpu) {
+            (GlassRenderer::Gpu, Some(gpu)) => {
+                format!("blur {:.2} · lens {:.2}", gpu.blur_ms, gpu.composite_ms)
+            }
+            _ => "—".into(),
+        };
 
         // Frame times above this miss a 60 Hz refresh.
         const BUDGET_MS: f32 = 1000. / 60.;
@@ -871,14 +889,9 @@ impl Demo {
                     .child("line = 16.7 ms"),
             )
             .child(stat_row(theme, "Frame", frame))
-            .child(stat_row(
-                theme,
-                "Glass",
-                match self.renderer {
-                    GlassRenderer::Gpu => "Metal shader".into(),
-                    GlassRenderer::Cpu => format!("{:.1} ms CPU", self.perf.glass_ms),
-                },
-            ))
+            .child(stat_row(theme, "GPU", gpu_frame))
+            .child(stat_row(theme, "Glass", glass))
+            .child(stat_row(theme, "", glass_split))
             .child(stat_row(theme, "CPU", cpu))
             .child(stat_row(theme, "Memory", memory))
             .child(stat_row(theme, "Threads", threads))
@@ -956,6 +969,9 @@ impl Render for Demo {
             window.request_animation_frame();
         }
         self.perf.frame(Instant::now());
+        // The first call turns GPU timing on; Metal only.
+        self.perf.gpu_frame(window.gpu_frame_stats());
+        self.perf.log(Instant::now());
 
         let theme = self.theme();
         let backdrop = Rc::new(Backdrop::animated(
