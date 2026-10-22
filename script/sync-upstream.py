@@ -349,12 +349,18 @@ def status():
             print(f"{branch:8} (missing)")
             continue
         if pre is None:
+            if not ref_exists(upstream_main):
+                print(f"{branch:8} Zed main, {upstream_main} not fetched")
+                continue
             behind = git("rev-list", "--count", f"{branch}..{upstream_main}")
             print(f"{branch:8} Zed main, {behind} upstream commits not merged")
             continue
         current, latest = based_on(branch, pre), latest_zed_tag(pre)
         fork_tags = git("tag", "--points-at", branch, "--list", "v*").split()
-        state = "up to date" if current == latest else f"behind (latest {latest})"
+        if latest is None:
+            state = "upstream tags not fetched"
+        else:
+            state = "up to date" if current == latest else f"behind (latest {latest})"
         print(f"{branch:8} zed {current or '-'}, {state}, fork tag at HEAD: {', '.join(fork_tags) or '-'}")
     for branch, source in DOWNSTREAM.items():
         if not ref_exists(f"refs/heads/{branch}"):
