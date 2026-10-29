@@ -20,6 +20,10 @@ env:
 
 jobs:
   sync:
+    # one sync per branch at a time; a newer pending run replaces an older pending one
+    concurrency:
+      group: sync-${{ inputs.branch }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -94,7 +98,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ inputs.branch }}-${{ github.run_id }}
+          # one cache per branch per day: nightly runs hourly, and a cache per run would evict the
+          # other branches' caches from the repo's 10 GB
+          key: cargo-${{ inputs.branch }}-${{ env.DAY }}
           restore-keys: cargo-${{ inputs.branch }}-
 
       - name: Check and test

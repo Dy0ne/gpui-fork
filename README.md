@@ -16,10 +16,10 @@ The channel branches follow Zed's release channels; the fork's own features flow
 | `main`         | newest Zed stable release (`vX.Y.Z`)      | apps — the default                                            |
 | `preview`      | newest Zed preview release (`vX.Y.Z-pre`) | trying the next release early; fork patches land here first   |
 | `nightly`      | Zed `main`                                | catching upstream breakage early; may be unstable             |
-| `experimental` | `nightly` + the fork's features           | developing [liquid glass](#liquid-glass) and other features   |
+| `experimental` | `nightly` + the fork's features, by hand  | developing [liquid glass](#liquid-glass) and other features   |
 | `liquid-glass` | `experimental`, promoted by hand          | the stable line of liquid glass — use this to build on it     |
 
-`nightly`, `preview` and `experimental` are synced automatically every day and `main` every three days, each only after it builds and its tests pass.
+`nightly` is synced automatically every hour, `preview` every day and `main` every three days, each only after it builds and its tests pass. `experimental` and `liquid-glass` are merged by hand.
 
 ### Tags
 
