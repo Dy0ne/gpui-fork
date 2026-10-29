@@ -12,12 +12,17 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{Context as _, Result};
 use block2::RcBlock;
-use foreign_types::ForeignTypeRef;
 use gpui::{DevicePixels, GpuFrameStats, Size};
-use metal::{COUNTER_DONT_SAMPLE, MTLCounterSamplingPoint, MTLStorageMode};
-use objc2::{msg_send, rc::Retained, runtime::AnyObject};
-use objc2_foundation::{NSData, NSRange};
+use objc2::{Message, rc::Retained, runtime::ProtocolObject};
+use objc2_foundation::NSRange;
+use objc2_metal::{
+    MTLClearColor, MTLCommandBuffer, MTLCounterDontSample, MTLCounterErrorValue,
+    MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor, MTLCounterSamplingPoint,
+    MTLCounterSet, MTLDevice, MTLLoadAction, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLStorageMode, MTLStoreAction, MTLTexture, MTLViewport,
+};
 use parking_lot::Mutex;
 
 /// Passes timed per frame: four per backdrop layer plus the final copy, so the layers of a frame
@@ -26,8 +31,6 @@ const MAX_TIMED_PASSES: usize = 61;
 /// Frames that can be in flight at once (`CAMetalLayer`'s maximum drawable count), each needing
 /// its own sample buffer until its command buffer completes.
 const SAMPLE_BUFFERS: usize = 3;
-/// `MTLCounterErrorValue`: the GPU couldn't take that sample.
-const COUNTER_ERROR: u64 = u64::MAX;
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Pass {
@@ -38,7 +41,7 @@ pub(crate) enum Pass {
 }
 
 struct SampleBuffer {
-    buffer: metal::CounterSampleBuffer,
+    buffer: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
     in_flight: Arc<AtomicBool>,
 }
 
@@ -62,7 +65,10 @@ pub(crate) struct GpuTimer {
 
 impl GpuTimer {
     /// The last completed frame's stats. The first call turns timing on.
-    pub(crate) fn stats(&mut self, device: &metal::Device) -> Option<GpuFrameStats> {
+    pub(crate) fn stats(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+    ) -> Option<GpuFrameStats> {
         if !self.enabled {
             self.enabled = true;
             self.sample_buffers = new_sample_buffers(device);
@@ -70,7 +76,11 @@ impl GpuTimer {
         *self.latest.lock()
     }
 
-    pub(crate) fn begin_frame(&mut self, device: &metal::Device, layer_count: usize) {
+    pub(crate) fn begin_frame(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        layer_count: usize,
+    ) {
         if !self.enabled {
             return;
         }
@@ -98,7 +108,7 @@ impl GpuTimer {
 
     /// Times the render pass `descriptor` describes, if this frame is measured and has samples
     /// left.
-    pub(crate) fn time_pass(&self, descriptor: &metal::RenderPassDescriptorRef, pass: Pass) {
+    pub(crate) fn time_pass(&self, descriptor: &MTLRenderPassDescriptor, pass: Pass) {
         let mut frame = self.frame.borrow_mut();
         let Some(frame) = frame.as_mut() else {
             return;
@@ -109,24 +119,30 @@ impl GpuTimer {
         if frame.passes.len() == MAX_TIMED_PASSES {
             return;
         }
-        let first = 2 * frame.passes.len() as u64;
+        let first = 2 * frame.passes.len();
         frame.passes.push(pass);
         // Only the fragment stage: these passes draw a quad or two, and on tile-based GPUs the
         // vertex stage of a pass runs early, overlapping earlier passes, so timing from the
         // start of vertex work would count most of the frame for every pass.
-        let attachment = descriptor.sample_buffer_attachments().object_at(0).unwrap();
-        attachment.set_sample_buffer(&buffer.buffer);
-        attachment.set_start_of_vertex_sample_index(COUNTER_DONT_SAMPLE);
-        attachment.set_end_of_vertex_sample_index(COUNTER_DONT_SAMPLE);
-        attachment.set_start_of_fragment_sample_index(first);
-        attachment.set_end_of_fragment_sample_index(first + 1);
+        // SAFETY: Index zero is within the sample buffer attachment array, and both sample
+        // indices are below the buffer's `2 * MAX_TIMED_PASSES` samples.
+        unsafe {
+            let attachment = descriptor
+                .sampleBufferAttachments()
+                .objectAtIndexedSubscript(0);
+            attachment.setSampleBuffer(Some(&buffer.buffer));
+            attachment.setStartOfVertexSampleIndex(MTLCounterDontSample);
+            attachment.setEndOfVertexSampleIndex(MTLCounterDontSample);
+            attachment.setStartOfFragmentSampleIndex(first);
+            attachment.setEndOfFragmentSampleIndex(first + 1);
+        }
     }
 
     /// Reads the frame's timings once `command_buffer` completes.
     pub(crate) fn end_frame(
         &mut self,
-        device: &metal::Device,
-        command_buffer: &metal::CommandBufferRef,
+        device: &ProtocolObject<dyn MTLDevice>,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     ) {
         let Some(frame) = self.frame.borrow_mut().take() else {
             return;
@@ -135,72 +151,82 @@ impl GpuTimer {
             .sample_buffers
             .get(frame.sample_buffer)
             .map(|buffer| (buffer.buffer.clone(), buffer.in_flight.clone()));
-        let device = device.clone();
+        let device = device.retain();
         let latest = self.latest.clone();
-        let block = RcBlock::new(move |command_buffer: ptr::NonNull<AnyObject>| {
-            objc2::rc::autoreleasepool(|_| {
-                // SAFETY: Metal passes the command buffer that completed.
-                let command_buffer = unsafe { command_buffer.as_ref() };
-                let (start, end): (f64, f64) = unsafe {
-                    (
-                        msg_send![command_buffer, GPUStartTime],
-                        msg_send![command_buffer, GPUEndTime],
-                    )
-                };
-                let mut stats = GpuFrameStats {
-                    frame: Duration::from_secs_f64((end - start).max(0.)),
-                    backdrop_layer_count: frame.layer_count,
-                    ..GpuFrameStats::default()
-                };
-                if let Some((buffer, in_flight)) = &sample_buffer {
-                    let samples = resolve(buffer, 2 * frame.passes.len());
-                    let nanos_per_tick =
-                        nanos_per_tick(frame.start_timestamps, sample_timestamps(&device));
-                    for (pass, pair) in frame.passes.iter().zip(samples.chunks_exact(2)) {
-                        let (start, end) = (pair[0], pair[1]);
-                        if start == COUNTER_ERROR || end == COUNTER_ERROR || end < start {
-                            continue;
+        let block = RcBlock::new(
+            move |command_buffer: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                objc2::rc::autoreleasepool(|_| {
+                    // SAFETY: Metal passes the command buffer that completed.
+                    let command_buffer = unsafe { command_buffer.as_ref() };
+                    let (start, end) = (command_buffer.GPUStartTime(), command_buffer.GPUEndTime());
+                    let mut stats = GpuFrameStats {
+                        frame: Duration::from_secs_f64((end - start).max(0.)),
+                        backdrop_layer_count: frame.layer_count,
+                        ..GpuFrameStats::default()
+                    };
+                    if let Some((buffer, in_flight)) = &sample_buffer {
+                        let samples = resolve(buffer, 2 * frame.passes.len());
+                        let nanos_per_tick =
+                            nanos_per_tick(frame.start_timestamps, sample_timestamps(&device));
+                        for (pass, pair) in frame.passes.iter().zip(samples.chunks_exact(2)) {
+                            let (start, end) = (pair[0], pair[1]);
+                            if start == MTLCounterErrorValue
+                                || end == MTLCounterErrorValue
+                                || end < start
+                            {
+                                continue;
+                            }
+                            let time = Duration::from_nanos(
+                                ((end - start) as f64 * nanos_per_tick) as u64,
+                            );
+                            match pass {
+                                Pass::BackdropBlur => stats.backdrop_blur += time,
+                                Pass::BackdropComposite => stats.backdrop_composite += time,
+                                Pass::BackdropCopy => stats.backdrop_copy += time,
+                            }
                         }
-                        let time =
-                            Duration::from_nanos(((end - start) as f64 * nanos_per_tick) as u64);
-                        match pass {
-                            Pass::BackdropBlur => stats.backdrop_blur += time,
-                            Pass::BackdropComposite => stats.backdrop_composite += time,
-                            Pass::BackdropCopy => stats.backdrop_copy += time,
-                        }
+                        in_flight.store(false, Ordering::Release);
                     }
-                    in_flight.store(false, Ordering::Release);
-                }
-                *latest.lock() = Some(stats);
-            });
-        });
-        // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
+                    *latest.lock() = Some(stats);
+                });
+            },
+        );
+        // SAFETY: Metal copies the block and invokes it once after this frame completes. Its
+        // captures are owned, and the shared stats and sample buffer flag are synchronized.
         unsafe {
-            command_buffer.add_completed_handler(&*RcBlock::as_ptr(&block).cast());
+            command_buffer.addCompletedHandler(RcBlock::as_ptr(&block));
         }
     }
 }
 
 /// Builds a render pass like `new_command_encoder_for_texture` in `metal_renderer.rs`, timed when
 /// `timer` measures this frame.
-pub(crate) fn new_timed_command_encoder<'a>(
+pub(crate) fn new_timed_command_encoder(
     timer: &GpuTimer,
     pass: Pass,
-    command_buffer: &'a metal::CommandBufferRef,
-    texture: &'a metal::TextureRef,
+    command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    texture: &ProtocolObject<dyn MTLTexture>,
     viewport_size: Size<DevicePixels>,
-    load_action: metal::MTLLoadAction,
-) -> &'a metal::RenderCommandEncoderRef {
-    let descriptor = metal::RenderPassDescriptor::new();
-    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
-    color_attachment.set_texture(Some(texture));
-    color_attachment.set_store_action(metal::MTLStoreAction::Store);
-    color_attachment.set_load_action(load_action);
-    color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
-    timer.time_pass(descriptor, pass);
+    load_action: MTLLoadAction,
+) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
+    let descriptor = MTLRenderPassDescriptor::new();
+    // SAFETY: Index zero is within the render pass's color attachment array.
+    let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+    color_attachment.setTexture(Some(texture));
+    color_attachment.setStoreAction(MTLStoreAction::Store);
+    color_attachment.setLoadAction(load_action);
+    color_attachment.setClearColor(MTLClearColor {
+        red: 0.,
+        green: 0.,
+        blue: 0.,
+        alpha: 0.,
+    });
+    timer.time_pass(&descriptor, pass);
 
-    let encoder = command_buffer.new_render_command_encoder(descriptor);
-    encoder.set_viewport(metal::MTLViewport {
+    let encoder = command_buffer
+        .renderCommandEncoderWithDescriptor(&descriptor)
+        .context("creating backdrop render command encoder")?;
+    encoder.setViewport(MTLViewport {
         originX: 0.0,
         originY: 0.0,
         width: i32::from(viewport_size.width) as f64,
@@ -208,28 +234,30 @@ pub(crate) fn new_timed_command_encoder<'a>(
         znear: 0.0,
         zfar: 1.0,
     });
-    encoder
+    Ok(encoder)
 }
 
-fn new_sample_buffers(device: &metal::Device) -> Vec<SampleBuffer> {
-    if !device.supports_counter_sampling(MTLCounterSamplingPoint::AtStageBoundary) {
+fn new_sample_buffers(device: &ProtocolObject<dyn MTLDevice>) -> Vec<SampleBuffer> {
+    if !device.supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary) {
         return Vec::new();
     }
-    let Some(timestamps) = device
-        .counter_sets()
-        .into_iter()
-        .find(|set| set.name() == "timestamp")
-    else {
+    let Some(timestamps) = device.counterSets().and_then(|sets| {
+        sets.iter()
+            .find(|set| set.name().to_string() == "timestamp")
+    }) else {
         return Vec::new();
     };
-    let descriptor = metal::CounterSampleBufferDescriptor::new();
-    descriptor.set_counter_set(&timestamps);
-    descriptor.set_sample_count(2 * MAX_TIMED_PASSES as u64);
-    descriptor.set_storage_mode(MTLStorageMode::Shared);
+    let descriptor = MTLCounterSampleBufferDescriptor::new();
+    descriptor.setCounterSet(Some(&timestamps));
+    // SAFETY: The count is positive and fits the timestamp counter set's limits.
+    unsafe {
+        descriptor.setSampleCount(2 * MAX_TIMED_PASSES);
+    }
+    descriptor.setStorageMode(MTLStorageMode::Shared);
     (0..SAMPLE_BUFFERS)
         .map_while(|_| {
             device
-                .new_counter_sample_buffer_with_descriptor(&descriptor)
+                .newCounterSampleBufferWithDescriptor_error(&descriptor)
                 .ok()
         })
         .map(|buffer| SampleBuffer {
@@ -239,17 +267,13 @@ fn new_sample_buffers(device: &metal::Device) -> Vec<SampleBuffer> {
         .collect()
 }
 
-/// The first `count` timestamps in `buffer`. `metal`'s own `resolve_counter_range` copies zero
-/// bytes (it sizes the copy from the still-empty `Vec`), so this calls Metal directly.
-fn resolve(buffer: &metal::CounterSampleBufferRef, count: usize) -> Vec<u64> {
+/// The first `count` timestamps in `buffer`.
+fn resolve(buffer: &ProtocolObject<dyn MTLCounterSampleBuffer>, count: usize) -> Vec<u64> {
     if count == 0 {
         return Vec::new();
     }
-    // SAFETY: `buffer` is a live MTLCounterSampleBuffer, and the range is within its sample count.
-    let data: Option<Retained<NSData>> = unsafe {
-        let buffer = &*buffer.as_ptr().cast::<AnyObject>();
-        msg_send![buffer, resolveCounterRange: NSRange::new(0, count)]
-    };
+    // SAFETY: The range is within the buffer's sample count.
+    let data = unsafe { buffer.resolveCounterRange(NSRange::new(0, count)) };
     data.map(|data| {
         data.to_vec()
             .chunks_exact(8)
@@ -259,9 +283,15 @@ fn resolve(buffer: &metal::CounterSampleBufferRef, count: usize) -> Vec<u64> {
     .unwrap_or_default()
 }
 
-fn sample_timestamps(device: &metal::Device) -> (u64, u64) {
+fn sample_timestamps(device: &ProtocolObject<dyn MTLDevice>) -> (u64, u64) {
     let (mut cpu, mut gpu) = (0, 0);
-    device.sample_timestamps(&mut cpu, &mut gpu);
+    // SAFETY: Both pointers are to live, writable locals.
+    unsafe {
+        device.sampleTimestamps_gpuTimestamp(
+            ptr::NonNull::from(&mut cpu),
+            ptr::NonNull::from(&mut gpu),
+        );
+    }
     (cpu, gpu)
 }
 
