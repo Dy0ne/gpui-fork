@@ -1,7 +1,8 @@
-# Merge Zed into the channel branches, then feed the fork's own branches (see script/sync-upstream.py):
-#   daily        nightly <- Zed main, preview <- newest -pre tag, then experimental <- nightly
+# Merge Zed into the channel branches (see script/sync-upstream.py):
+#   daily        nightly <- Zed main, preview <- newest -pre tag
 #   every 3 days main <- newest stable tag
-#   manual only  liquid-glass <- experimental (its stable line: promote when experimental is ready)
+#   manual only  experimental <- nightly, liquid-glass <- experimental (the fork's own branches:
+#                merge when ready, by dispatching this workflow or with a local `update`)
 # Each branch is synced by sync-branch.yml and pushed only if it builds and its tests pass.
 #
 # GITHUB_TOKEN cannot push commits that change .github/workflows, so workflow changes must be
@@ -16,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       branches:
-        description: Branches to sync (all = the three channels, then experimental)
+        description: Branches to sync (all = the three channels)
         type: choice
         options: [all, nightly, preview, main, experimental, liquid-glass]
         default: all
@@ -60,11 +61,3 @@ jobs:
     uses: ./.github/workflows/sync-branch.yml
     with:
       branch: ${{ matrix.branch }}
-
-  # after nightly is pushed, so experimental merges the nightly that passed its checks
-  experimental:
-    needs: [plan, sync]
-    if: ${{ !cancelled() && contains(fromJSON(needs.plan.outputs.branches), 'nightly') }}
-    uses: ./.github/workflows/sync-branch.yml
-    with:
-      branch: experimental
