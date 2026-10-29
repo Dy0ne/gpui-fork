@@ -19,7 +19,7 @@ The channel branches follow Zed's release channels; the fork's own features flow
 | `experimental` | `nightly` + the fork's features, by hand  | developing [liquid glass](#liquid-glass) and other features   |
 | `liquid-glass` | `experimental`, promoted by hand          | the stable line of liquid glass — use this to build on it     |
 
-`nightly` and `preview` are synced automatically every day and `main` every three days, each only after it builds and its tests pass. `experimental` and `liquid-glass` are merged by hand.
+`nightly` is synced automatically every hour, `preview` every day and `main` every three days, each only after it builds and its tests pass. `experimental` and `liquid-glass` are merged by hand.
 
 ### Tags
 
