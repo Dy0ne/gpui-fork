@@ -105,13 +105,27 @@ mod apple_build {
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../gpui")
     }
 
+    /// Fork-only shaders, appended to `shaders.metal` so they stay out of that upstream file.
+    const FORK_SHADERS: &[&str] = &["./src/metal_renderer/backdrop.metal"];
+
+    /// `shaders.metal` followed by `FORK_SHADERS`.
+    fn shader_source(shader_path: &Path) -> String {
+        let mut source = std::fs::read_to_string(shader_path).unwrap();
+        for path in FORK_SHADERS {
+            println!("cargo:rerun-if-changed={path}");
+            source.push('\n');
+            source.push_str(&std::fs::read_to_string(path).unwrap());
+        }
+        source
+    }
+
     /// To enable runtime compilation, we need to "stitch" the shaders file with the generated header
     /// so that it is self-contained.
     #[cfg(feature = "runtime_shaders")]
     fn emit_stitched_shaders(header_path: &Path) {
         fn stitch_header(header: &Path, shader_path: &Path) -> std::io::Result<PathBuf> {
             let header_contents = std::fs::read_to_string(header)?;
-            let shader_contents = std::fs::read_to_string(shader_path)?;
+            let shader_contents = shader_source(shader_path);
             let stitched_contents = format!("{header_contents}\n{shader_contents}");
             let out_path =
                 PathBuf::from(env::var("OUT_DIR").unwrap()).join("stitched_shaders.metal");
@@ -167,7 +181,7 @@ mod apple_build {
         // location is the build's canonical output directory, never the
         // checkout (corgi rejects artifacts that embed the build path).
         let staged_shader_path = out_dir.join("shaders.metal");
-        std::fs::copy(shader_path, &staged_shader_path).unwrap();
+        std::fs::write(&staged_shader_path, shader_source(Path::new(shader_path))).unwrap();
 
         // When targeting macOS 12+, both `metal` and `metallib` also record
         // their working directory in the metallib. Run them from OUT_DIR so

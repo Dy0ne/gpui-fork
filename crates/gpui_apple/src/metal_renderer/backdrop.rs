@@ -431,7 +431,7 @@ pub(super) struct BackdropTextures {
     pong: Retained<ProtocolObject<dyn MTLTexture>>,
 }
 
-/// Mirrors `BackdropParams` in `shaders.metal`, which reads it byte for byte through
+/// Mirrors `BackdropParams` in `backdrop.metal`, which reads it byte for byte through
 /// `setVertexBytes`/`setFragmentBytes`, so field order and sizes must match. Every field
 /// after `blur_direction` is 4 bytes, which keeps both layouts free of padding.
 #[repr(C)]

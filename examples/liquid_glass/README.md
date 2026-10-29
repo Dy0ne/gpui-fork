@@ -14,7 +14,7 @@ The demo crate is built at `opt-level = 3` even in dev builds (`[package.metadat
 - **Metal** (default on macOS and iOS): each panel is a div with `.backdrop(blur, BackdropEffect::LiquidGlass(..))`. The GPU blurs and refracts everything painted behind the glass, including text and other panels, at almost no CPU cost.
 - **CPU** (every other platform, and for comparison): without backdrop layers GPUI has no backdrop filter, user shaders or render-to-texture, so the glass is rendered on the CPU from the scene description and uploaded as an image every frame. It only refracts the scene shapes, not text or other panels.
 
-Both draw the same optics. If you change them, change `render_glass` in `src/glass.rs` and `liquid_glass` in `crates/gpui_apple/src/shaders.metal` together.
+Both draw the same optics. If you change them, change `render_glass` in `src/glass.rs` and `liquid_glass` in `crates/gpui_apple/src/metal_renderer/backdrop.metal` together.
 
 ## Layout
 
