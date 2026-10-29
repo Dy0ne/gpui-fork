@@ -14,7 +14,8 @@ those release branches, not on Zed's `main`. This fork mirrors the channels:
 
 Hotfixes for stable go on main and are merged back into preview by hand.
 
-Downstream branches hold fork features and are fed from another local branch, not from upstream:
+Downstream branches hold fork features and are fed from another local branch, not from upstream,
+only when asked for (CI never merges them on its own):
 
   experimental  <- nightly        (fork features are developed here)
   liquid-glass  <- experimental   (stable line of the liquid glass work)
