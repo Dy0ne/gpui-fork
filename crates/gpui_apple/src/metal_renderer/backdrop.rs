@@ -3,24 +3,49 @@
 //! Fork-only. Everything lives here rather than in `metal_renderer.rs`, which is upstream, so
 //! upstream changes to the renderer merge against a handful of hooks instead of this code:
 //! the `backdrop` field, `begin_backdrop_frame`/`end_backdrop_frame` in `render_frame`, and
-//! `backdrop_textures`, `draw_backdrop_layers` and `finish_backdrop_frame` in
-//! `draw_primitives_to_texture`.
+//! `backdrop_textures`, `quads_below_layer`, `draw_backdrop_layers`, `resume_scene_pass` and
+//! `finish_backdrop_frame` in `draw_primitives_to_texture`.
+//!
+//! Upstream draws a frame in one render pass: every opaque quad first, front to back with
+//! depth writes, then the batches in paint order, depth-tested against those quads. A backdrop
+//! layer samples what is behind it, so a frame with layers is split into one pass per run of
+//! layers. Each pass draws only the opaque quads painted in its part of the frame; drawing
+//! them all up front would let a layer blur quads that are painted on top of it. A later pass
+//! is entirely above an earlier one, so its depth buffer starts cleared and never has to be
+//! stored (upstream keeps it memoryless on Apple GPUs).
 
-use super::{MetalRenderer, build_pipeline_state};
+use super::{GlobalInputIndex, InstanceBindings, MetalRenderer};
 use crate::gpu_timer::{self, GpuTimer};
 use anyhow::{Context as _, Result};
 use gpui::{
     BackdropLayer, Bounds, Corners, DevicePixels, GpuFrameStats, Rgba, ScaledBackdropEffect,
-    ScaledPixels, Scene, Size, size,
+    ScaledPixels, Scene, Size, quad_depth_scale, size,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLLibrary, MTLLoadAction, MTLPixelFormat,
-    MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPipelineDescriptor, MTLRenderPipelineState,
-    MTLScissorRect, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MTLBlendFactor, MTLBlendOperation, MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLLibrary,
+    MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
+    MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLScissorRect,
+    MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage, MTLViewport,
 };
-use std::{mem, ptr};
+use std::{mem, ops::Range, ptr};
+
+/// How many of `scene.quads` are painted below `scene.backdrop_layers[layer]`, or all of them
+/// if there is no such layer: where the frame's quads split between the render pass before
+/// that layer and the one after it.
+pub(super) fn quads_below_layer(scene: &Scene, layer: usize) -> usize {
+    scene
+        .backdrop_layers
+        .get(layer)
+        .map_or(scene.quads.len(), |layer| {
+            // Both are sorted by draw order, and `Scene::batches` puts a layer after the quads
+            // that share its order.
+            scene
+                .quads
+                .partition_point(|quad| quad.order <= layer.order)
+        })
+}
 
 pub(super) struct BackdropRenderer {
     downsample_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
@@ -106,7 +131,7 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
     ) -> Result<Option<BackdropTextures>> {
         let (width, height) = (viewport_size.width.0, viewport_size.height.0);
-        // Zero-sized texture creation aborts; see `update_path_intermediate_textures`.
+        // Zero-sized texture creation aborts.
         if scene.backdrop_layers.is_empty() || width <= 0 || height <= 0 {
             return Ok(None);
         }
@@ -152,6 +177,65 @@ impl MetalRenderer {
             self.draw_backdrop_layer(layer, textures, viewport_size, command_buffer)?;
         }
         Ok(())
+    }
+
+    /// Continues rendering the scene into `target` after `draw_backdrop_layers`, in a new pass
+    /// like the one upstream's `draw_primitives_to_texture` starts the frame with, except that
+    /// it keeps `target` and draws only `opaque_quads`: those painted above the layers just
+    /// drawn and below the next ones.
+    pub(super) fn resume_scene_pass(
+        &self,
+        scene: &Scene,
+        opaque_quads: Range<usize>,
+        instance_bindings: &InstanceBindings,
+        target: &ProtocolObject<dyn MTLTexture>,
+        depth_texture: &ProtocolObject<dyn MTLTexture>,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
+        let descriptor = MTLRenderPassDescriptor::new();
+        // SAFETY: Index zero is within the render pass's color attachment array.
+        let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+        color_attachment.setTexture(Some(target));
+        color_attachment.setLoadAction(MTLLoadAction::Load);
+        color_attachment.setStoreAction(MTLStoreAction::Store);
+        // Everything in this pass is above everything in the earlier ones, so it needs none of
+        // their depth.
+        let depth_attachment = descriptor.depthAttachment();
+        depth_attachment.setTexture(Some(depth_texture));
+        depth_attachment.setLoadAction(MTLLoadAction::Clear);
+        depth_attachment.setClearDepth(0.0);
+        depth_attachment.setStoreAction(MTLStoreAction::DontCare);
+
+        let command_encoder = command_buffer
+            .renderCommandEncoderWithDescriptor(&descriptor)
+            .context("creating render command encoder after backdrop layers")?;
+        command_encoder.setViewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: i32::from(viewport_size.width) as f64,
+            height: i32::from(viewport_size.height) as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        let depth_scale = quad_depth_scale(scene.quads.len());
+        // SAFETY: Metal copies both values, which match every vertex shader's
+        // `GlobalInputIndex_ViewportSize` and `GlobalInputIndex_DepthScale` arguments.
+        unsafe {
+            command_encoder.setVertexBytes_length_atIndex(
+                ptr::NonNull::from(&viewport_size).cast(),
+                mem::size_of_val(&viewport_size),
+                GlobalInputIndex::ViewportSize as usize,
+            );
+            command_encoder.setVertexBytes_length_atIndex(
+                ptr::NonNull::from(&depth_scale).cast(),
+                mem::size_of_val(&depth_scale),
+                GlobalInputIndex::DepthScale as usize,
+            );
+        }
+        self.draw_opaque_quads(opaque_quads, instance_bindings, &command_encoder);
+        command_encoder.setDepthStencilState(Some(&self.depth_test_state));
+        Ok(command_encoder)
     }
 
     /// Copies a frame rendered offscreen for its backdrop layers to `texture`.
@@ -328,14 +412,9 @@ impl MetalRenderer {
             encoder.setScissorRect(scissor);
         }
         encoder.setRenderPipelineState(pipeline_state);
-        // SAFETY: The unit vertices, copied params and size, and source texture match the
-        // backdrop shaders' slots; `BackdropParams` mirrors the shader struct byte for byte.
+        // SAFETY: The copied params and size, and source texture match the backdrop shaders'
+        // slots; `BackdropParams` mirrors the shader struct byte for byte.
         unsafe {
-            encoder.setVertexBuffer_offset_atIndex(
-                Some(&self.unit_vertices),
-                0,
-                BackdropInputIndex::Vertices as usize,
-            );
             encoder.setVertexBytes_length_atIndex(
                 ptr::NonNull::from(params).cast(),
                 mem::size_of::<BackdropParams>(),
@@ -352,15 +431,16 @@ impl MetalRenderer {
                 BackdropInputIndex::Params as usize,
             );
             encoder.setFragmentTexture_atIndex(Some(source), 0);
-            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 6);
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
         }
         encoder.endEncoding();
         Ok(())
     }
 }
 
-/// Like `build_pipeline_state`, but blending is optional: the passes that copy, downsample and
-/// blur whole textures must replace pixels, not blend over them.
+/// Like upstream's `build_pipeline_state`, but for the backdrop passes, which have no depth
+/// attachment. Only the composite blends: the passes that copy, downsample and blur whole
+/// textures must replace pixels, not blend over them.
 fn build_backdrop_pipeline_state(
     device: &ProtocolObject<dyn MTLDevice>,
     library: &ProtocolObject<dyn MTLLibrary>,
@@ -369,16 +449,6 @@ fn build_backdrop_pipeline_state(
     fragment_fn_name: &str,
     blending: bool,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
-    if blending {
-        return build_pipeline_state(
-            device,
-            library,
-            label,
-            vertex_fn_name,
-            fragment_fn_name,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-    }
     let vertex_fn = library
         .newFunctionWithName(&NSString::from_str(vertex_fn_name))
         .with_context(|| format!("locating vertex function {vertex_fn_name}"))?;
@@ -393,7 +463,13 @@ fn build_backdrop_pipeline_state(
     // SAFETY: Index zero is within the pipeline's color attachment array.
     let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
     color_attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
-    color_attachment.setBlendingEnabled(false);
+    color_attachment.setBlendingEnabled(blending);
+    color_attachment.setRgbBlendOperation(MTLBlendOperation::Add);
+    color_attachment.setAlphaBlendOperation(MTLBlendOperation::Add);
+    color_attachment.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
+    color_attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+    color_attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    color_attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
 
     device
         .newRenderPipelineStateWithDescriptor_error(&descriptor)
@@ -477,9 +553,70 @@ impl Default for BackdropParams {
     }
 }
 
+/// Buffer slots of the backdrop shaders in `backdrop.metal`.
 #[repr(C)]
 enum BackdropInputIndex {
-    Vertices = 0,
     Params = 1,
     ViewportSize = 2,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metal_renderer::InstanceBufferPool;
+    use gpui::{ContentMask, Quad, bounds, point};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    fn square(origin: f32, size: f32) -> Bounds<ScaledPixels> {
+        bounds(
+            point(ScaledPixels(origin), ScaledPixels(origin)),
+            gpui::size(ScaledPixels(size), ScaledPixels(size)),
+        )
+    }
+
+    fn quad(bounds: Bounds<ScaledPixels>, color: gpui::Hsla) -> Quad {
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: color.into(),
+            ..Quad::default()
+        }
+    }
+
+    /// Opaque quads are drawn ahead of the batches, and a layer must not blur the ones painted
+    /// on top of it.
+    #[test]
+    fn backdrop_layer_blurs_only_what_is_below_it() -> Result<()> {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(square(0., 64.), gpui::red()));
+        let layer_bounds = square(8., 48.);
+        scene.insert_primitive(BackdropLayer {
+            order: 0,
+            bounds: layer_bounds,
+            content_mask: ContentMask {
+                bounds: layer_bounds,
+            },
+            corner_radii: Corners::default(),
+            blur: ScaledPixels(4.),
+            effect: ScaledBackdropEffect::Frost,
+            opacity: 1.,
+        });
+        scene.insert_primitive(quad(square(24., 16.), gpui::blue()));
+        scene.finish();
+        assert_eq!(quads_below_layer(&scene, 0), 1);
+        assert_eq!(quads_below_layer(&scene, 1), 2);
+
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())))?;
+        let image =
+            renderer.render_scene_to_image(&scene, size(DevicePixels(64), DevicePixels(64)))?;
+
+        // On the layer, two pixels from the blue quad: well within the blur's reach of it.
+        assert_eq!(image.get_pixel(21, 32).0, [255, 0, 0, 255]);
+        // The quad itself is drawn over the layer, and the scene outside the layer is untouched.
+        assert_eq!(image.get_pixel(32, 32).0, [0, 0, 255, 255]);
+        assert_eq!(image.get_pixel(2, 2).0, [255, 0, 0, 255]);
+        Ok(())
+    }
 }
