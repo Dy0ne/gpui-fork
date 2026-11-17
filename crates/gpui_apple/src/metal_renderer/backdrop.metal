@@ -32,10 +32,10 @@ struct BackdropFullscreenOutput {
   float4 position [[position]];
 };
 
-vertex BackdropFullscreenOutput backdrop_fullscreen_vertex(
-    uint unit_vertex_id [[vertex_id]],
-    constant float2 *unit_vertices [[buffer(0)]]) {
-  float2 unit_vertex = unit_vertices[unit_vertex_id];
+// Like the upstream shaders, the backdrop passes draw a four-vertex triangle strip whose unit
+// square corners come from the vertex id.
+vertex BackdropFullscreenOutput backdrop_fullscreen_vertex(uint vertex_id [[vertex_id]]) {
+  float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
   BackdropFullscreenOutput output;
   output.position = float4(unit_vertex.x * 2. - 1., 1. - unit_vertex.y * 2., 0., 1.);
   return output;
@@ -51,6 +51,10 @@ fragment float4 backdrop_downsample_fragment(BackdropFullscreenOutput input [[st
   return source.sample(linear_sampler, uv);
 }
 
+float backdrop_gaussian(float x, float sigma) {
+  return exp(-(x * x) / (2. * sigma * sigma)) / (sqrt(2. * M_PI_F) * sigma);
+}
+
 fragment float4 backdrop_blur_fragment(BackdropFullscreenOutput input [[stage_in]],
                                        texture2d<float> source [[texture(0)]],
                                        constant BackdropParams &params [[buffer(1)]]) {
@@ -62,7 +66,7 @@ fragment float4 backdrop_blur_fragment(BackdropFullscreenOutput input [[stage_in
   float weight_sum = 0.;
   for (int tap = -taps; tap <= taps; tap++) {
     float offset = float(tap) * params.blur_tap_step;
-    float weight = gaussian(offset, params.blur_sigma);
+    float weight = backdrop_gaussian(offset, params.blur_sigma);
     color += source.sample(linear_sampler, uv + params.blur_direction * offset) * weight;
     weight_sum += weight;
   }
@@ -76,26 +80,16 @@ fragment float4 backdrop_copy_fragment(BackdropFullscreenOutput input [[stage_in
 
 struct BackdropCompositeOutput {
   float4 position [[position]];
-  float clip_distance [[clip_distance]][4];
-};
-
-struct BackdropCompositeFragmentInput {
-  float4 position [[position]];
 };
 
 vertex BackdropCompositeOutput backdrop_composite_vertex(
-    uint unit_vertex_id [[vertex_id]],
-    constant float2 *unit_vertices [[buffer(0)]],
+    uint vertex_id [[vertex_id]],
     constant BackdropParams &params [[buffer(1)]],
     constant Size_DevicePixels *viewport_size [[buffer(2)]]) {
-  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+  ClippedVertex clipped = clip_to_mask(unit_vertex, params.bounds, params.content_mask);
   BackdropCompositeOutput output;
-  output.position = to_device_position(unit_vertex, params.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, params.bounds, params.content_mask);
-  output.clip_distance[0] = clip_distance.x;
-  output.clip_distance[1] = clip_distance.y;
-  output.clip_distance[2] = clip_distance.z;
-  output.clip_distance[3] = clip_distance.w;
+  output.position = to_device_position_impl(clipped.position, viewport_size);
   return output;
 }
 
@@ -168,7 +162,7 @@ float3 liquid_glass(float2 point, texture2d<float> blurred, constant BackdropPar
   return mix(color, float3(params.rim_tone >= 0. ? 1. : 0.), light);
 }
 
-fragment float4 backdrop_composite_fragment(BackdropCompositeFragmentInput input [[stage_in]],
+fragment float4 backdrop_composite_fragment(BackdropCompositeOutput input [[stage_in]],
                                             texture2d<float> blurred [[texture(0)]],
                                             constant BackdropParams &params [[buffer(1)]]) {
   float2 point = input.position.xy;
