@@ -131,6 +131,8 @@ pub struct MetalRenderer {
     display_link_mode: DisplayLinkMode,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
+    /// Whether the last scene drawn to the layer let native views show through it.
+    shows_native_views: bool,
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     path_tiles_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     shadows_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
@@ -140,6 +142,7 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     polychrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     surfaces_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    native_views_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     /// Backdrop layers and GPU timing, see `backdrop.rs`.
     backdrop: backdrop::BackdropRenderer,
     depth_write_state: Retained<ProtocolObject<dyn MTLDepthStencilState>>,
@@ -358,6 +361,16 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
             true,
         )?;
+        // Blending is off so that the transparent output replaces what was drawn beneath it.
+        let native_views_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "native_views",
+            "native_view_vertex",
+            "native_view_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            false,
+        )?;
         let backdrop = backdrop::BackdropRenderer::new(&device, &library)?;
 
         let depth_write_state = build_depth_stencil_state(&device, true)?;
@@ -391,6 +404,7 @@ impl MetalRenderer {
             is_apple_gpu,
             is_unified_memory,
             opaque,
+            shows_native_views: false,
             command_queue,
             path_tiles_pipeline_state,
             shadows_pipeline_state,
@@ -400,6 +414,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            native_views_pipeline_state,
             backdrop,
             depth_write_state,
             depth_test_state,
@@ -491,7 +506,7 @@ impl MetalRenderer {
     pub fn update_transparency(&mut self, transparent: bool) {
         self.opaque = !transparent;
         if let Some(layer) = &self.layer {
-            layer.setOpaque(!transparent);
+            layer.setOpaque(self.opaque && !self.shows_native_views);
         }
     }
 
@@ -509,6 +524,13 @@ impl MetalRenderer {
                 return;
             }
         };
+        // Native views sit beneath the layer, so it can only be opaque, and
+        // eligible for direct-to-display presentation, while none are showing.
+        let shows_native_views = !scene.native_views.is_empty();
+        if shows_native_views != self.shows_native_views {
+            self.shows_native_views = shows_native_views;
+            layer.setOpaque(self.opaque && !shows_native_views);
+        }
         let drawable = match &mut self.display_link_mode {
             DisplayLinkMode::Attached { drawable } => {
                 let Some(drawable) = drawable.take() else {
@@ -867,6 +889,9 @@ impl MetalRenderer {
                         return Err(error);
                     }
                 }
+                PrimitiveBatch::NativeViews(range) => {
+                    self.draw_native_views(range, instance_bindings, &command_encoder)
+                }
                 PrimitiveBatch::BackdropLayers(range) => {
                     command_encoder.endEncoding();
                     self.draw_backdrop_layers(
@@ -968,6 +993,35 @@ impl MetalRenderer {
                 4,
                 quads.len(),
                 0,
+            );
+        }
+    }
+
+    fn draw_native_views(
+        &self,
+        native_views: Range<usize>,
+        instance_bindings: &InstanceBindings,
+        command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    ) {
+        if native_views.is_empty() {
+            return;
+        }
+
+        command_encoder.setRenderPipelineState(&self.native_views_pipeline_state);
+        // SAFETY: The SurfaceBounds instances match the shader layout and slot.
+        // Metal retains the buffer, and writer.finish publishes its writes.
+        unsafe {
+            command_encoder.setVertexBuffer_offset_atIndex(
+                Some(&instance_bindings.native_views.buffer),
+                instance_bindings.native_views.offset,
+                SurfaceInputIndex::Surfaces as usize,
+            );
+            command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                MTLPrimitiveType::TriangleStrip,
+                0,
+                4,
+                native_views.len(),
+                native_views.start,
             );
         }
     }
@@ -1466,6 +1520,7 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
     surfaces: InstanceBinding,
+    native_views: InstanceBinding,
 }
 
 fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
@@ -1487,6 +1542,12 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
+        }))?,
+        native_views: writer.write_iter(scene.native_views.iter().map(|native_view| {
+            SurfaceBounds {
+                bounds: native_view.bounds,
+                content_mask: native_view.content_mask,
+            }
         }))?,
     })
 }
